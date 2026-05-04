@@ -18,14 +18,16 @@ Exasol:
   which rewrites PostgreSQL-flavored SQL and metadata probes before Exasol
   executes them.
 * The gateway handles protocol behavior, authentication forwarding, session
-  setup, TLS policy, read-only routing, and PostgreSQL client/session commands.
+  setup, TLS policy, capability-based statement routing, and PostgreSQL
+  client/session commands.
 
 ## Current Status
 
 Implemented:
 
 * PostgreSQL startup and cleartext password authentication.
-* Simple Query and Extended Query paths for read-only statements.
+* Simple Query and Extended Query paths for row-returning statements,
+  supported DML, and selected Exasol-equivalent DDL.
 * Per-client direct Exasol WebSocket sessions.
 * Exasol TLS support with normal certificate validation, SHA-256 fingerprint
   pinning, and a development-only `validate_certificate = false` escape hatch.
@@ -49,9 +51,16 @@ Implemented:
 
 Known limits:
 
-* The gateway is currently read-only. DML and DDL are rejected by policy.
+* DML is enabled for Exasol-backed execution, and selected DDL is enabled for
+  Exasol-equivalent table, view, and schema operations. Broader PostgreSQL
+  object families remain capability-gated.
 * PostgreSQL transaction wrappers are acknowledged for client compatibility;
-  full PostgreSQL transaction semantics are not implemented.
+  full PostgreSQL transaction semantics, savepoints, and two-phase commit are
+  not implemented.
+* PostgreSQL SQL cursors are implemented as gateway-managed, materialized,
+  read-only cursor state for supported row-returning queries. Binary cursors,
+  updatable cursors, positioned writes, and unbounded/spill-managed cursor
+  policies are not implemented yet.
 * Binary prepared-statement parameters are not implemented.
 * PostgreSQL catalog compatibility is broad enough to expose the documented
   surface, but many PostgreSQL-only features intentionally return empty rows or

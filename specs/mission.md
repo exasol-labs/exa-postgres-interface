@@ -23,6 +23,7 @@ Current target workflow:
 * The application listens for PostgreSQL wire-protocol client connections.
 * PostgreSQL-capable clients such as DbVisualizer, DBeaver, `psql`, and JDBC-based tools connect to the application as if it were connecting to PostgreSQL.
 * The application authenticates to Exasol, initializes the Exasol session, and forwards or translates client activity so the user can reach Exasol.
+* The application SHOULD support PostgreSQL read and write operations when the operation has a safe, documented Exasol equivalent or a deliberately documented gateway-managed compatibility behavior.
 
 Future target workflow:
 
@@ -36,10 +37,12 @@ The prototype SHOULD establish a useful PostgreSQL-compatible path from common P
 * Support username/password authentication first.
 * Connect to Exasol using configured connection information and customer credentials.
 * Automatically initialize each Exasol session with a Python preprocessor script.
-* Use a Python preprocessor based on `sqlglot` to convert SQL from PostgreSQL dialect to Exasol dialect.
+* Use a configured SQL translation mechanism to convert SQL from PostgreSQL dialect to Exasol dialect.
 * Return query results, metadata, errors, and connection state in forms PostgreSQL clients can consume.
 * Make unsupported protocol, SQL, authentication, or metadata behavior explicit.
 * Expose broad PostgreSQL metadata compatibility through Exasol-side `PG_CATALOG` and `INFORMATION_SCHEMA` schemas.
+* Support PostgreSQL read and write statements where Exasol provides equivalent behavior, including DQL, DML, relevant DDL, transaction control, privilege management, and session commands.
+* Provide gateway-managed compatibility for PostgreSQL client behaviors that do not exist natively in Exasol when the behavior can be implemented without hiding material semantic differences.
 * Run as a systemd-managed Linux service.
 
 Longer-term capabilities SHOULD include broader PostgreSQL protocol compatibility and additional Exasol authentication types.
@@ -53,6 +56,8 @@ The prototype SHALL NOT include:
 * Sidecar packaging or integration into Exasol deployment topology.
 * A guarantee that arbitrary PostgreSQL applications work unchanged.
 * Full coverage of every PostgreSQL SQL construct, system catalog, extension, or behavior.
+* PostgreSQL-specific engine features with no Exasol equivalent, unless explicitly implemented as a documented gateway compatibility behavior.
+* Silent emulation of PostgreSQL semantics that would misrepresent Exasol behavior, transaction isolation, object lifecycle, locking, privilege behavior, or write durability.
 * Production hardening beyond what is necessary to evaluate the service safely.
 
 ## Domain Glossary
@@ -61,9 +66,12 @@ The prototype SHALL NOT include:
 * PostgreSQL client: Any tool or application that can connect to a PostgreSQL server, including DbVisualizer.
 * Protocol server: The application built by this repository; it accepts PostgreSQL wire-protocol connections.
 * Exasol session: A database session opened by the protocol server against Exasol on behalf of a client connection.
+* SQL translation mechanism: The configured component that transforms incoming PostgreSQL-flavored SQL into Exasol-compatible SQL before execution. It MAY be an Exasol-side preprocessor script, an application-layer translator, or a hybrid approach when documented by the spec.
 * Python preprocessor: An Exasol-side preprocessor script that transforms incoming SQL before execution.
 * Metadata compatibility layer: Exasol-side `PG_CATALOG` and `INFORMATION_SCHEMA` schemas containing PostgreSQL-shaped views and helper functions backed by Exasol system metadata where possible.
-* SQL dialect translation: Conversion of PostgreSQL-flavored SQL to Exasol-flavored SQL, expected to use `sqlglot`.
+* SQL dialect translation: Conversion of PostgreSQL-flavored SQL to Exasol-flavored SQL.
+* Capability matrix: A documented mapping from PostgreSQL statement families, functions, data types, metadata, and protocol/session behaviors to their Exasol equivalents, gateway-managed compatibility behavior, or explicit unsupported status.
+* Gateway-managed cursor: A PostgreSQL SQL cursor behavior implemented by the protocol server using Exasol query execution and server-side cursor state because Exasol does not provide a direct PostgreSQL-style cursor object.
 * Add-on process: A separately installed application that runs between client tools and Exasol without modifying the database engine.
 
 ## Tech Stack
@@ -73,14 +81,18 @@ Current implementation stack:
 * Rust binary built with Cargo.
 * `pgwire` for PostgreSQL wire-protocol server behavior.
 * Direct Exasol WebSocket protocol client for database sessions.
-* Exasol-side Python preprocessor script using `sqlglot` for SQL dialect translation.
+* Exasol-side Python preprocessor script using `sqlglot` for current SQL dialect translation.
+* `sqlglot` and `polyglot-sql` are candidate SQL translation engines for the broader read/write compatibility design.
 * TOML configuration for listen address, Exasol endpoint, TLS policy, logging, and session initialization.
 * systemd unit template for Linux service operation.
 
 Open decisions:
 
+* Whether broader translation should remain Exasol-side through the existing Python preprocessor, move into the Rust application layer, or use a hybrid architecture.
+* Whether `polyglot-sql` should replace, supplement, or only be benchmarked against `sqlglot`.
 * Prepared statement parameter translation and type handling.
-* Exasol-backed transaction semantics.
+* Exasol-backed transaction semantics and PostgreSQL transaction-status reporting.
+* Gateway-managed SQL cursor scope, memory limits, transaction lifetime, and scrollability.
 * GitHub release automation and binary distribution format.
 
 ## Build, Test, Lint, and Format Commands
@@ -124,7 +136,7 @@ Target prototype data flow:
 1. A PostgreSQL client opens a connection to the protocol server.
 2. The protocol server performs the required PostgreSQL wire-protocol startup and authentication exchange.
 3. The protocol server opens an Exasol connection for the client session.
-4. The protocol server initializes the Exasol session so PostgreSQL-dialect SQL is converted through the Python `sqlglot` preprocessor.
+4. The protocol server initializes the Exasol session so PostgreSQL-dialect SQL is converted through the configured SQL translation mechanism.
 5. The client sends SQL or metadata requests through PostgreSQL protocol messages.
 6. The protocol server routes requests to Exasol, maps responses back to PostgreSQL-compatible protocol messages, and returns them to the client.
 7. The protocol server closes or cleans up Exasol session state when the client disconnects.
@@ -140,6 +152,7 @@ benchmark tooling.
 * PostgreSQL protocol compatibility is the desired direction, but compatibility boundaries MUST be documented as the prototype discovers unsupported behavior.
 * Exasol remains the source of truth for database execution and behavior.
 * PostgreSQL metadata compatibility SHOULD live in Exasol-side views/functions where practical, not in ad hoc gateway-side query matching.
+* PostgreSQL read/write compatibility SHALL be capability-driven: the gateway may support a PostgreSQL operation only when the mapped Exasol behavior, gateway-managed compatibility behavior, or unsupported status is documented.
 * The protocol server SHALL NOT silently emulate or alter database semantics in ways that hide meaningful Exasol/PostgreSQL differences.
 * Session initialization MUST make the SQL preprocessor behavior explicit and observable enough to debug.
 * Specs SHOULD be written before substantial behavior is implemented.
@@ -153,7 +166,8 @@ Likely dependency categories:
 * PostgreSQL wire-protocol server library or implementation primitives.
 * Exasol client library or driver.
 * Exasol Python preprocessor script support.
-* `sqlglot` for PostgreSQL-to-Exasol SQL dialect conversion.
+* `sqlglot` for current PostgreSQL-to-Exasol SQL dialect conversion.
+* `polyglot-sql` as a candidate Rust/Python/FFI SQL parser and transpiler for PostgreSQL-to-Exasol SQL dialect conversion.
 * DbVisualizer for the initial manual smoke test.
 * Exasol Personal for integration testing.
 * Linux packaging and process supervision tools, once packaging is planned.
@@ -181,6 +195,9 @@ Resolved implementation decisions:
 Open decisions:
 
 * How to package and publish release binaries.
-* How much PostgreSQL write/transaction behavior, if any, should be supported.
+* Which PostgreSQL read/write statement families have safe Exasol equivalents and should become supported capabilities.
+* Which PostgreSQL write, transaction, cursor, metadata, and session behaviors require gateway-managed compatibility instead of direct Exasol SQL.
+* Which PostgreSQL behaviors must remain explicitly unsupported because no safe Exasol equivalent exists.
+* Whether `sqlglot`, `polyglot-sql`, or a hybrid design should be the long-term translation architecture.
 * Which additional PostgreSQL clients should become formal compatibility
   targets.

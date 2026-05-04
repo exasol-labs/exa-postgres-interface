@@ -1,8 +1,8 @@
 # Client Compatibility Test Framework
 
-This repository now includes a JDBC-driven compatibility suite for the read-only
+This repository now includes a JDBC-driven compatibility suite for the
 PostgreSQL gateway. The goal is not only to keep a smoke test green, but to
-show which JDBC metadata calls and PostgreSQL-flavored `SELECT` queries work,
+show which JDBC metadata calls and PostgreSQL-flavored statement families work,
 which fail, and which fail only for specific client personas.
 
 Current status:
@@ -24,7 +24,8 @@ The framework has three layers:
   `java.sql.DatabaseMetaData` method with deterministic sample arguments and
   records pass/fail, SQLState, and result shape.
 * A persona query corpus with must-pass baseline probes plus exploratory probes
-  drawn from real PostgreSQL clients and analytical SQL patterns.
+  drawn from real PostgreSQL clients, analytical SQL patterns, and non-read
+  statement families.
 * A gateway-vs-direct Exasol latency benchmark for small probes, result-set
   transfer ladders, and heavier analytical queries that return either many rows
   or only a single row.
@@ -39,6 +40,14 @@ Current personas:
 * `dbeaver`: direct `pg_catalog` schema browser queries.
 * `analyst`: PostgreSQL-flavored read-only stress queries that may expose
   translation or semantic gaps.
+* `dml`: `INSERT`, `UPDATE`, `DELETE`, and `MERGE` probes.
+* `ddl`: `CREATE`, `ALTER`, `TRUNCATE`, and `DROP` probes using scratch
+  objects when needed.
+* `transaction`: `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and related
+  transaction-control probes.
+* `session`: `SET`, `SHOW`, `RESET`, and similar session-state probes.
+* `utility`: `EXPLAIN`, `COPY`, `LOCK`, `VACUUM`, `ANALYZE`, and related
+  PostgreSQL utility-command probes.
 
 Recent client-driven compatibility fixes covered:
 
@@ -99,7 +108,8 @@ Useful options:
 
 `--strict` only fails the process when must-pass baseline probes fail.
 Exploratory failures are still reported, but they stay informational by
-default.
+default. This matters more now that the corpus includes statement families that
+the gateway may still reject by design or by current implementation limits.
 
 To compare query latency against a direct Exasol JDBC connection:
 
@@ -144,6 +154,12 @@ The summary separates must-pass failures from exploratory failures so the team
 can keep core smoke coverage stable while still learning about unsupported
 PostgreSQL surface area.
 
+SQL probes are no longer limited to result sets. A probe may report:
+
+* `statement=resultset` with result shape and sample rows.
+* `statement=update` with JDBC update count and whether additional results were
+  exposed.
+
 The benchmark report prints, for each query pair:
 
 * direct Exasol latency statistics;
@@ -180,6 +196,8 @@ especially important to watch:
 
 * Rich metadata methods beyond the paths already covered by DbVisualizer,
   DBeaver, pgJDBC, and the existing smoke tests.
+* DML/DDL paths that may still be rejected by gateway policy, translation
+  limits, or Exasol semantic differences.
 * Queries that depend on PostgreSQL catalog helper functions such as
   `pg_get_expr`, `pg_get_constraintdef`, or other `pg_catalog` helpers in
   shapes not yet observed from real clients.

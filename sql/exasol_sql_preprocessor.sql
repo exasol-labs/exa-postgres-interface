@@ -506,6 +506,25 @@ def rewrite_pg_catalog(sql):
     return sql
 
 def rewrite_sqlglot_edge_cases(sql):
+    information_schema_columns = (
+        "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME",
+        "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE",
+        "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH",
+        "NUMERIC_PRECISION", "NUMERIC_PRECISION_RADIX", "NUMERIC_SCALE",
+        "DATETIME_PRECISION", "INTERVAL_TYPE", "INTERVAL_PRECISION",
+        "CHARACTER_SET_CATALOG", "CHARACTER_SET_SCHEMA", "CHARACTER_SET_NAME",
+        "COLLATION_CATALOG", "COLLATION_SCHEMA", "COLLATION_NAME",
+        "DOMAIN_CATALOG", "DOMAIN_SCHEMA", "DOMAIN_NAME", "UDT_CATALOG",
+        "UDT_SCHEMA", "UDT_NAME", "SCOPE_CATALOG", "SCOPE_SCHEMA",
+        "SCOPE_NAME", "MAXIMUM_CARDINALITY", "DTD_IDENTIFIER",
+        "IS_SELF_REFERENCING", "IS_IDENTITY", "IDENTITY_GENERATION",
+        "IDENTITY_START", "IDENTITY_INCREMENT", "IDENTITY_MAXIMUM",
+        "IDENTITY_MINIMUM", "IDENTITY_CYCLE", "IS_GENERATED",
+        "GENERATION_EXPRESSION", "IS_UPDATABLE"
+    )
+    information_schema_columns_projection = ", ".join(
+        '"{}"'.format(column) for column in information_schema_columns
+    )
     sql = sql.replace(
         'PG_CATALOG."PG_FOREIGN_SERVER" AS fs',
         'PG_CATALOG."PG_FOREIGN_SERVER" AS srv',
@@ -544,6 +563,14 @@ def rewrite_sqlglot_edge_cases(sql):
         "CO.OPTION_VALUE AS COLUMN_OPTION, C.ORDINAL_POSITION, C.IS_IDENTITY",
         "CO.OPTION_VALUE AS COLUMN_OPTION, C.ORDINAL_POSITION AS ORDINAL_POSITION_DUP, C.IS_IDENTITY",
     )
+    sql = re.sub(
+        r"(?i)\bEND\s+AS\s+type_name\s*,\s*(?:[A-Z_][A-Z0-9_]*\.)?\*\s+FROM\s+INFORMATION_SCHEMA\.COLUMNS\b",
+        "END AS type_name, {} FROM INFORMATION_SCHEMA.COLUMNS".format(
+            information_schema_columns_projection
+        ),
+        sql,
+    )
+    sql = re.sub(r"(?i)\bAS\s+VARCHAR\s*\)", "AS VARCHAR(2000000))", sql)
     return sql
 
 def rewrite_ilike(sql):

@@ -196,6 +196,71 @@ WHERE tmp.pos = 1
     assert "_PG_EXPANDARRAY" not in translated.upper()
 
 
+def test_rewrites_qlik_table_list_varchar_casts():
+    namespace = load_preprocessor_namespace()
+    sql = """
+SELECT * FROM (
+  select CAST(current_database() AS VARCHAR(127)) AS "TABLE_CAT",
+         CAST(nspname AS VARCHAR(127)) AS "TABLE_SCHEM",
+         CAST(relname AS VARCHAR(127)) AS "TABLE_NAME",
+         CAST(
+           CASE
+             WHEN nspname ~'^pg_temp' THEN 'LOCAL TEMPORARY'
+             WHEN relkind = 'r' THEN CASE
+               WHEN nspname IN ('pg_catalog', 'information_schema', 'pg_toast') THEN 'SYSTEM TABLE'
+               ELSE 'TABLE'
+             END
+             WHEN relkind = 'v' THEN 'VIEW'
+             WHEN relkind = 'm' THEN 'MATVIEW'
+           END AS VARCHAR(127)
+         ) AS "TABLE_TYPE",
+         CAST('' AS VARCHAR(250)) AS "REMARKS"
+  FROM pg_catalog.pg_class c, pg_catalog.pg_namespace n
+  WHERE relkind IN('r', 'v', 'm') AND n.oid = relnamespace
+) S
+WHERE "TABLE_SCHEM" like 'DEMO_SALES'::varchar
+  AND "TABLE_TYPE" IN ('TABLE'::varchar, 'SYSTEM TABLE'::varchar)
+ORDER BY "TABLE_TYPE", "TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME"
+"""
+    translated = namespace["adapter_call"](sql)
+    assert "AS VARCHAR)" not in translated.upper()
+    assert "CAST('DEMO_SALES' AS VARCHAR(2000000))" in translated
+    assert "CAST('TABLE' AS VARCHAR(2000000))" in translated
+    assert "CAST('SYSTEM TABLE' AS VARCHAR(2000000))" in translated
+
+
+def test_rewrites_qlik_column_list_type_name_star_projection():
+    namespace = load_preprocessor_namespace()
+    sql = """
+SELECT
+  table_catalog AS TABLE_CAT,
+  table_schema AS TABLE_SCHEM,
+  table_name AS TABLE_NAME,
+  column_name AS COLUMN_NAME,
+  type_name AS TYPE_NAME,
+  ordinal_position AS ORDINAL_POSITION
+FROM (
+  SELECT
+    CASE udt_name
+      WHEN 'boolean' THEN 'bool'
+      WHEN 'integer' THEN 'int4'
+      WHEN 'character varying' THEN 'varchar'
+      ELSE udt_name
+    END AS type_name,
+    *
+  FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE table_schema LIKE 'DEMO_FINANCE'::varchar
+    AND table_name LIKE 'OPEN_AR_V'::varchar
+) S
+ORDER BY table_catalog, table_schema, table_name, ordinal_position
+"""
+    translated = namespace["adapter_call"](sql)
+    assert "TYPE_NAME, * FROM INFORMATION_SCHEMA.COLUMNS" not in translated.upper()
+    assert 'TYPE_NAME, "TABLE_CATALOG", "TABLE_SCHEMA"' in translated.upper()
+    assert "CAST('DEMO_FINANCE' AS VARCHAR(2000000))" in translated
+    assert "CAST('OPEN_AR_V' AS VARCHAR(2000000))" in translated
+
+
 if __name__ == "__main__":
     test_rewrites_postgres_qualified_operator_syntax()
     test_rewrites_metabase_table_privileges_query()
@@ -203,3 +268,5 @@ if __name__ == "__main__":
     test_rewrites_metabase_describe_fields_query_family()
     test_rewrites_metabase_describe_fks_query_family()
     test_rewrites_metabase_describe_indexes_query_family()
+    test_rewrites_qlik_table_list_varchar_casts()
+    test_rewrites_qlik_column_list_type_name_star_projection()

@@ -3,7 +3,10 @@ use std::sync::LazyLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementPlan {
-    Read,
+    Execute {
+        command: &'static str,
+        row_count: RowCountPolicy,
+    },
     ClientSet,
     ClientTransactionStart,
     ClientTransactionEnd {
@@ -17,11 +20,72 @@ pub enum StatementPlan {
         columns: Vec<String>,
         rows: Vec<Vec<Option<String>>>,
     },
+    Cursor(CursorPlan),
     Empty,
     Reject {
         sqlstate: &'static str,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorPlan {
+    Declare(CursorDeclare),
+    Fetch(CursorPosition),
+    Move(CursorPosition),
+    Close(CursorClose),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorDeclare {
+    pub name: String,
+    pub query: String,
+    pub scroll: bool,
+    pub hold: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorPosition {
+    pub name: String,
+    pub direction: CursorDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorClose {
+    One(String),
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorDirection {
+    Next,
+    Prior,
+    First,
+    Last,
+    Absolute(i64),
+    Relative(i64),
+    Forward(Option<i64>),
+    Backward(Option<i64>),
+    All,
+    Count(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowCountPolicy {
+    Include,
+    Omit,
+}
+
+impl StatementPlan {
+    pub fn is_cursor_unsafe_query(&self) -> bool {
+        !matches!(
+            self,
+            StatementPlan::Execute {
+                command: "SELECT",
+                ..
+            }
+        )
+    }
 }
 
 static COMMENT_RE: LazyLock<Regex> =
@@ -33,6 +97,12 @@ static RESET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^RESET\s+(ALL|[A-Za-z_][A-Za-z0-9_.]*)$").unwrap());
 static SHOW_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^SHOW\s+([A-Za-z_][A-Za-z0-9_ .-]*)$").unwrap());
+static DECLARE_CURSOR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?is)^DECLARE\s+(?P<name>"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s+(?P<options>(?:(?:BINARY|INSENSITIVE|ASENSITIVE|NO\s+SCROLL|SCROLL)\s+)*)CURSOR\s*(?P<hold>WITH\s+HOLD|WITHOUT\s+HOLD)?\s+FOR\s+(?P<query>.+)$"#,
+    )
+    .unwrap()
+});
 
 pub fn classify_statement(sql: &str) -> StatementPlan {
     let cleaned = normalize_sql(sql);
@@ -54,33 +124,318 @@ pub fn classify_statement(sql: &str) -> StatementPlan {
 
     let keyword = first_keyword(&cleaned);
     match keyword.as_str() {
-        "SELECT" | "WITH" | "VALUES" => StatementPlan::Read,
-        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE" | "COPY" | "IMPORT" | "EXPORT" => {
-            StatementPlan::Reject {
-                sqlstate: "0A000",
-                message: "write statements are outside the first prototype scope".to_owned(),
-            }
-        }
-        "CREATE" | "ALTER" | "DROP" | "RENAME" | "COMMENT" | "GRANT" | "REVOKE" => {
-            StatementPlan::Reject {
-                sqlstate: "0A000",
-                message: "DDL statements are outside the first prototype scope".to_owned(),
-            }
-        }
+        "SELECT" | "WITH" | "VALUES" => execute("SELECT", RowCountPolicy::Omit),
+        "INSERT" => execute("INSERT", RowCountPolicy::Include),
+        "UPDATE" => execute("UPDATE", RowCountPolicy::Include),
+        "DELETE" => execute("DELETE", RowCountPolicy::Include),
+        "MERGE" => execute("MERGE", RowCountPolicy::Include),
+        "TRUNCATE" => execute("TRUNCATE TABLE", RowCountPolicy::Omit),
+        "CREATE" => classify_create(&cleaned),
+        "ALTER" => classify_alter(&cleaned),
+        "DROP" => classify_drop(&cleaned),
+        "COMMENT" => execute("COMMENT", RowCountPolicy::Omit),
+        "GRANT" => execute("GRANT", RowCountPolicy::Omit),
+        "REVOKE" => execute("REVOKE", RowCountPolicy::Omit),
+        "COPY" => unsupported_policy(
+            "COPY requires a separate bulk data movement design before it can be exposed",
+        ),
+        "IMPORT" | "EXPORT" => unsupported_policy(
+            "Exasol IMPORT/EXPORT are not PostgreSQL commands and are not exposed through the gateway policy",
+        ),
+        "DECLARE" => classify_declare_cursor(&cleaned),
+        "FETCH" => classify_cursor_position("FETCH", &cleaned),
+        "MOVE" => classify_cursor_position("MOVE", &cleaned),
+        "CLOSE" => classify_close_cursor(&cleaned),
+        "PREPARE" | "EXECUTE" | "DEALLOCATE" => unsupported_policy(
+            "SQL prepared statement commands are not implemented; use PostgreSQL extended query protocol",
+        ),
         "BEGIN" | "START" => StatementPlan::ClientTransactionStart,
+        "COMMIT" if second_keyword(&cleaned) == "PREPARED" => unsupported_no_equivalent(
+            "PostgreSQL two-phase commit is not supported because no safe Exasol equivalent is configured",
+        ),
         "COMMIT" => StatementPlan::ClientTransactionEnd { command: "COMMIT" },
+        "ROLLBACK" if matches!(second_keyword(&cleaned).as_str(), "TO" | "PREPARED") => {
+            unsupported_no_equivalent(
+                "PostgreSQL savepoints and two-phase commit are not supported because no safe Exasol equivalent is configured",
+            )
+        }
         "ROLLBACK" => StatementPlan::ClientTransactionEnd {
             command: "ROLLBACK",
         },
-        "SAVEPOINT" | "RELEASE" => StatementPlan::ClientSet,
+        "SAVEPOINT" | "RELEASE" => unsupported_no_equivalent(
+            "PostgreSQL savepoints are not supported because no safe Exasol equivalent is configured",
+        ),
+        "ABORT" => StatementPlan::ClientTransactionEnd {
+            command: "ROLLBACK",
+        },
+        "END" => StatementPlan::ClientTransactionEnd { command: "COMMIT" },
         "SET" | "RESET" | "SHOW" => StatementPlan::Reject {
             sqlstate: "0A000",
             message: "unsupported PostgreSQL session command".to_owned(),
         },
+        "LISTEN" | "NOTIFY" | "UNLISTEN" => unsupported_no_equivalent(
+            "PostgreSQL asynchronous notification commands have no Exasol equivalent",
+        ),
+        "VACUUM" | "REINDEX" | "CLUSTER" | "CHECKPOINT" | "ANALYZE" => unsupported_no_equivalent(
+            "PostgreSQL maintenance commands have no safe Exasol equivalent in this gateway",
+        ),
         other => StatementPlan::Reject {
             sqlstate: "0A000",
             message: format!("unsupported SQL statement class: {other}"),
         },
+    }
+}
+
+fn classify_declare_cursor(sql: &str) -> StatementPlan {
+    let Some(cap) = DECLARE_CURSOR_RE.captures(sql) else {
+        return StatementPlan::Reject {
+            sqlstate: "42601",
+            message: "unsupported DECLARE syntax; only SQL cursor declarations are supported"
+                .to_owned(),
+        };
+    };
+    let name = unquote_identifier(cap.name("name").map(|m| m.as_str()).unwrap_or_default());
+    let options = cap
+        .name("options")
+        .map(|m| m.as_str())
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let hold = cap
+        .name("hold")
+        .is_some_and(|m| m.as_str().eq_ignore_ascii_case("WITH HOLD"));
+    let query = cap
+        .name("query")
+        .map(|m| m.as_str().trim().to_owned())
+        .unwrap_or_default();
+
+    if options.split_whitespace().any(|token| token == "BINARY") {
+        return unsupported_policy("binary SQL cursors are not implemented");
+    }
+    if options.contains("INSENSITIVE") || options.contains("ASENSITIVE") {
+        return unsupported_policy("cursor sensitivity options are not implemented");
+    }
+    if contains_positioned_cursor_write(&query) {
+        return unsupported_policy(
+            "updatable cursors, FOR UPDATE, FOR SHARE, and positioned writes are not implemented",
+        );
+    }
+
+    StatementPlan::Cursor(CursorPlan::Declare(CursorDeclare {
+        name,
+        query,
+        scroll: options.contains("SCROLL") && !options.contains("NO SCROLL"),
+        hold,
+    }))
+}
+
+fn classify_cursor_position(command: &'static str, sql: &str) -> StatementPlan {
+    let Some(position) = parse_cursor_position(command, sql) else {
+        return StatementPlan::Reject {
+            sqlstate: "42601",
+            message: format!("unsupported {command} cursor syntax"),
+        };
+    };
+    match command {
+        "FETCH" => StatementPlan::Cursor(CursorPlan::Fetch(position)),
+        "MOVE" => StatementPlan::Cursor(CursorPlan::Move(position)),
+        _ => unreachable!("unsupported cursor position command"),
+    }
+}
+
+fn classify_close_cursor(sql: &str) -> StatementPlan {
+    let tokens = sql.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() != 2 {
+        return StatementPlan::Reject {
+            sqlstate: "42601",
+            message: "unsupported CLOSE cursor syntax".to_owned(),
+        };
+    }
+    if tokens[1].eq_ignore_ascii_case("ALL") {
+        StatementPlan::Cursor(CursorPlan::Close(CursorClose::All))
+    } else {
+        StatementPlan::Cursor(CursorPlan::Close(CursorClose::One(unquote_identifier(
+            tokens[1],
+        ))))
+    }
+}
+
+fn parse_cursor_position(command: &str, sql: &str) -> Option<CursorPosition> {
+    let tokens = sql.split_whitespace().collect::<Vec<_>>();
+    if tokens.first()?.to_ascii_uppercase() != command || tokens.len() < 2 {
+        return None;
+    }
+
+    let (direction_tokens, name) = if tokens.len() >= 3
+        && matches!(
+            tokens[tokens.len() - 2].to_ascii_uppercase().as_str(),
+            "FROM" | "IN"
+        ) {
+        (&tokens[1..tokens.len() - 2], tokens[tokens.len() - 1])
+    } else if tokens.len() == 2 {
+        (&[][..], tokens[1])
+    } else {
+        (&tokens[1..tokens.len() - 1], tokens[tokens.len() - 1])
+    };
+
+    Some(CursorPosition {
+        name: unquote_identifier(name),
+        direction: parse_cursor_direction(direction_tokens)?,
+    })
+}
+
+fn parse_cursor_direction(tokens: &[&str]) -> Option<CursorDirection> {
+    match tokens {
+        [] => Some(CursorDirection::Next),
+        [one] if one.eq_ignore_ascii_case("NEXT") => Some(CursorDirection::Next),
+        [one] if one.eq_ignore_ascii_case("PRIOR") => Some(CursorDirection::Prior),
+        [one] if one.eq_ignore_ascii_case("FIRST") => Some(CursorDirection::First),
+        [one] if one.eq_ignore_ascii_case("LAST") => Some(CursorDirection::Last),
+        [one] if one.eq_ignore_ascii_case("ALL") => Some(CursorDirection::All),
+        [one] if one.eq_ignore_ascii_case("FORWARD") => Some(CursorDirection::Forward(Some(1))),
+        [one] if one.eq_ignore_ascii_case("BACKWARD") => Some(CursorDirection::Backward(Some(1))),
+        [one] => one.parse::<i64>().ok().map(CursorDirection::Count),
+        [keyword, value] if keyword.eq_ignore_ascii_case("ABSOLUTE") => {
+            value.parse::<i64>().ok().map(CursorDirection::Absolute)
+        }
+        [keyword, value] if keyword.eq_ignore_ascii_case("RELATIVE") => {
+            value.parse::<i64>().ok().map(CursorDirection::Relative)
+        }
+        [keyword, value] if keyword.eq_ignore_ascii_case("FORWARD") => {
+            if value.eq_ignore_ascii_case("ALL") {
+                Some(CursorDirection::Forward(None))
+            } else {
+                value.parse::<i64>().ok().map(|count| {
+                    if count < 0 {
+                        CursorDirection::Backward(Some(-count))
+                    } else {
+                        CursorDirection::Forward(Some(count))
+                    }
+                })
+            }
+        }
+        [keyword, value] if keyword.eq_ignore_ascii_case("BACKWARD") => {
+            if value.eq_ignore_ascii_case("ALL") {
+                Some(CursorDirection::Backward(None))
+            } else {
+                value.parse::<i64>().ok().map(|count| {
+                    if count < 0 {
+                        CursorDirection::Forward(Some(-count))
+                    } else {
+                        CursorDirection::Backward(Some(count))
+                    }
+                })
+            }
+        }
+        _ => None,
+    }
+}
+
+fn contains_positioned_cursor_write(query: &str) -> bool {
+    Regex::new(
+        r"(?i)\bFOR\s+(UPDATE|SHARE|NO\s+KEY\s+UPDATE|KEY\s+SHARE)\b|\bWHERE\s+CURRENT\s+OF\b",
+    )
+    .unwrap()
+    .is_match(query)
+}
+
+fn unquote_identifier(identifier: &str) -> String {
+    identifier
+        .trim()
+        .trim_end_matches(';')
+        .trim_matches('"')
+        .replace("\"\"", "\"")
+}
+
+fn execute(command: &'static str, row_count: RowCountPolicy) -> StatementPlan {
+    StatementPlan::Execute { command, row_count }
+}
+
+fn classify_create(sql: &str) -> StatementPlan {
+    match second_keyword(sql).as_str() {
+        "TABLE" => execute("CREATE TABLE", RowCountPolicy::Omit),
+        "VIEW" => execute("CREATE VIEW", RowCountPolicy::Omit),
+        "SCHEMA" => execute("CREATE SCHEMA", RowCountPolicy::Omit),
+        "ROLE" | "USER" => unsupported_policy(
+            "role and user creation require explicit PostgreSQL-to-Exasol privilege mapping before they can be exposed",
+        ),
+        "FUNCTION" | "PROCEDURE" | "SCRIPT" => unsupported_policy(
+            "routine creation requires explicit PostgreSQL-to-Exasol routine mapping before it can be exposed",
+        ),
+        "INDEX" | "EXTENSION" | "PUBLICATION" | "SUBSCRIPTION" | "POLICY" | "RULE" | "EVENT"
+        | "TRIGGER" | "TABLESPACE" | "SERVER" | "FOREIGN" | "ACCESS" | "TEXT" | "OPERATOR"
+        | "LANGUAGE" | "CAST" | "COLLATION" | "CONVERSION" | "DOMAIN" | "TYPE" | "STATISTICS"
+        | "TRANSFORM" => unsupported_no_equivalent(&format!(
+            "PostgreSQL CREATE {} has no supported Exasol equivalent in this gateway",
+            second_keyword(sql)
+        )),
+        other => StatementPlan::Reject {
+            sqlstate: "0A000",
+            message: format!("unsupported PostgreSQL CREATE target: {other}"),
+        },
+    }
+}
+
+fn classify_alter(sql: &str) -> StatementPlan {
+    match second_keyword(sql).as_str() {
+        "TABLE" => execute("ALTER TABLE", RowCountPolicy::Omit),
+        "VIEW" => execute("ALTER VIEW", RowCountPolicy::Omit),
+        "SCHEMA" => execute("ALTER SCHEMA", RowCountPolicy::Omit),
+        "ROLE" | "USER" => unsupported_policy(
+            "role and user alteration require explicit PostgreSQL-to-Exasol privilege mapping before they can be exposed",
+        ),
+        "SYSTEM" => {
+            unsupported_policy("ALTER SYSTEM is not exposed through the PostgreSQL gateway policy")
+        }
+        "FUNCTION" | "PROCEDURE" | "ROUTINE" | "EXTENSION" | "PUBLICATION" | "SUBSCRIPTION"
+        | "POLICY" | "RULE" | "EVENT" | "TRIGGER" | "TABLESPACE" | "SERVER" | "FOREIGN"
+        | "ACCESS" | "TEXT" | "OPERATOR" | "LANGUAGE" | "COLLATION" | "CONVERSION" | "DOMAIN"
+        | "TYPE" | "STATISTICS" => unsupported_no_equivalent(&format!(
+            "PostgreSQL ALTER {} has no supported Exasol equivalent in this gateway",
+            second_keyword(sql)
+        )),
+        other => StatementPlan::Reject {
+            sqlstate: "0A000",
+            message: format!("unsupported PostgreSQL ALTER target: {other}"),
+        },
+    }
+}
+
+fn classify_drop(sql: &str) -> StatementPlan {
+    match second_keyword(sql).as_str() {
+        "TABLE" => execute("DROP TABLE", RowCountPolicy::Omit),
+        "VIEW" => execute("DROP VIEW", RowCountPolicy::Omit),
+        "SCHEMA" => execute("DROP SCHEMA", RowCountPolicy::Omit),
+        "ROLE" | "USER" => unsupported_policy(
+            "role and user dropping require explicit PostgreSQL-to-Exasol privilege mapping before they can be exposed",
+        ),
+        "FUNCTION" | "PROCEDURE" | "SCRIPT" => unsupported_policy(
+            "routine dropping requires explicit PostgreSQL-to-Exasol routine mapping before it can be exposed",
+        ),
+        "INDEX" | "EXTENSION" | "PUBLICATION" | "SUBSCRIPTION" | "POLICY" | "RULE" | "EVENT"
+        | "TRIGGER" | "TABLESPACE" | "SERVER" | "FOREIGN" | "ACCESS" | "TEXT" | "OPERATOR"
+        | "LANGUAGE" | "CAST" | "COLLATION" | "CONVERSION" | "DOMAIN" | "TYPE" | "STATISTICS"
+        | "TRANSFORM" | "OWNED" => unsupported_no_equivalent(&format!(
+            "PostgreSQL DROP {} has no supported Exasol equivalent in this gateway",
+            second_keyword(sql)
+        )),
+        other => StatementPlan::Reject {
+            sqlstate: "0A000",
+            message: format!("unsupported PostgreSQL DROP target: {other}"),
+        },
+    }
+}
+
+fn unsupported_policy(message: &str) -> StatementPlan {
+    StatementPlan::Reject {
+        sqlstate: "0A000",
+        message: format!("unsupported by gateway policy: {message}"),
+    }
+}
+
+fn unsupported_no_equivalent(message: &str) -> StatementPlan {
+    StatementPlan::Reject {
+        sqlstate: "0A000",
+        message: format!("unsupported because no Exasol equivalent is available: {message}"),
     }
 }
 
@@ -99,6 +454,20 @@ fn first_keyword(sql: &str) -> String {
         .unwrap_or_default()
         .trim_start_matches('(')
         .to_ascii_uppercase()
+}
+
+fn second_keyword(sql: &str) -> String {
+    let mut tokens = sql.split_whitespace().skip(1).map(|token| {
+        token
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .to_ascii_uppercase()
+    });
+    let first = tokens.next().unwrap_or_default();
+    if first == "OR" && tokens.next().as_deref() == Some("REPLACE") {
+        tokens.next().unwrap_or_default()
+    } else {
+        first
+    }
 }
 
 fn is_safe_set(sql: &str) -> bool {
@@ -125,7 +494,7 @@ fn local_show(sql: &str) -> Option<StatementPlan> {
         "datestyle" => "ISO, YMD",
         "timezone" | "time_zone" => "Etc/UTC",
         "transaction_isolation" | "transaction_isolation_level" => "read committed",
-        "transaction_read_only" => "on",
+        "transaction_read_only" => "off",
         "standard_conforming_strings" => "on",
         "client_encoding" => "UTF8",
         "server_version" => "16.6-exasol-gateway",
@@ -346,10 +715,130 @@ mod tests {
 
     #[test]
     fn classifies_read_and_write() {
-        assert_eq!(classify_statement("SELECT 1"), StatementPlan::Read);
-        assert!(matches!(
+        assert_eq!(
+            classify_statement("SELECT 1"),
+            StatementPlan::Execute {
+                command: "SELECT",
+                row_count: RowCountPolicy::Omit
+            }
+        );
+        assert_eq!(
             classify_statement("DELETE FROM t"),
-            StatementPlan::Reject { .. }
+            StatementPlan::Execute {
+                command: "DELETE",
+                row_count: RowCountPolicy::Include
+            }
+        );
+        assert_eq!(
+            classify_statement("INSERT INTO t VALUES (1)"),
+            StatementPlan::Execute {
+                command: "INSERT",
+                row_count: RowCountPolicy::Include
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_supported_ddl_by_object_type() {
+        assert_eq!(
+            classify_statement("CREATE TABLE t (id int)"),
+            StatementPlan::Execute {
+                command: "CREATE TABLE",
+                row_count: RowCountPolicy::Omit
+            }
+        );
+        assert_eq!(
+            classify_statement("DROP VIEW v"),
+            StatementPlan::Execute {
+                command: "DROP VIEW",
+                row_count: RowCountPolicy::Omit
+            }
+        );
+        assert_eq!(
+            classify_statement("CREATE OR REPLACE TABLE t AS SELECT 1 AS id"),
+            StatementPlan::Execute {
+                command: "CREATE TABLE",
+                row_count: RowCountPolicy::Omit
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_postgres_only_objects_with_no_equivalent() {
+        assert!(matches!(
+            classify_statement("CREATE EXTENSION hstore"),
+            StatementPlan::Reject { message, .. } if message.contains("no Exasol equivalent")
+        ));
+        assert!(matches!(
+            classify_statement("LISTEN channel"),
+            StatementPlan::Reject { message, .. } if message.contains("no Exasol equivalent")
+        ));
+    }
+
+    #[test]
+    fn rejects_unimplemented_gateway_managed_capabilities_by_policy() {
+        assert!(matches!(
+            classify_statement("CREATE USER u IDENTIFIED BY 'secret'"),
+            StatementPlan::Reject { message, .. } if message.contains("unsupported by gateway policy")
+        ));
+    }
+
+    #[test]
+    fn classifies_supported_cursor_commands() {
+        assert_eq!(
+            classify_statement("DECLARE plain_cursor CURSOR FOR SELECT 1"),
+            StatementPlan::Cursor(CursorPlan::Declare(CursorDeclare {
+                name: "plain_cursor".to_owned(),
+                query: "SELECT 1".to_owned(),
+                scroll: false,
+                hold: false,
+            }))
+        );
+        assert_eq!(
+            classify_statement("DECLARE c SCROLL CURSOR WITH HOLD FOR SELECT 1"),
+            StatementPlan::Cursor(CursorPlan::Declare(CursorDeclare {
+                name: "c".to_owned(),
+                query: "SELECT 1".to_owned(),
+                scroll: true,
+                hold: true,
+            }))
+        );
+        assert_eq!(
+            classify_statement("FETCH FORWARD 5 FROM c"),
+            StatementPlan::Cursor(CursorPlan::Fetch(CursorPosition {
+                name: "c".to_owned(),
+                direction: CursorDirection::Forward(Some(5)),
+            }))
+        );
+        assert_eq!(
+            classify_statement("FETCH FORWARD FROM c"),
+            StatementPlan::Cursor(CursorPlan::Fetch(CursorPosition {
+                name: "c".to_owned(),
+                direction: CursorDirection::Forward(Some(1)),
+            }))
+        );
+        assert_eq!(
+            classify_statement("MOVE BACKWARD ALL IN c"),
+            StatementPlan::Cursor(CursorPlan::Move(CursorPosition {
+                name: "c".to_owned(),
+                direction: CursorDirection::Backward(None),
+            }))
+        );
+        assert_eq!(
+            classify_statement("CLOSE c"),
+            StatementPlan::Cursor(CursorPlan::Close(CursorClose::One("c".to_owned())))
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_cursor_semantics() {
+        assert!(matches!(
+            classify_statement("DECLARE c BINARY CURSOR FOR SELECT 1"),
+            StatementPlan::Reject { message, .. } if message.contains("binary")
+        ));
+        assert!(matches!(
+            classify_statement("DECLARE c CURSOR FOR SELECT * FROM t FOR UPDATE"),
+            StatementPlan::Reject { message, .. } if message.contains("updatable cursors")
         ));
     }
 
@@ -383,7 +872,10 @@ mod tests {
             classify_statement(
                 "SELECT d.datname AS table_cat FROM pg_catalog.pg_database d ORDER BY d.datname",
             ),
-            StatementPlan::Read
+            StatementPlan::Execute {
+                command: "SELECT",
+                row_count: RowCountPolicy::Omit
+            }
         );
     }
 
@@ -391,7 +883,10 @@ mod tests {
     fn lets_pg_namespace_catalog_query_reach_exasol() {
         assert_eq!(
             classify_statement("SELECT n.nspname AS table_schem FROM pg_catalog.pg_namespace n"),
-            StatementPlan::Read
+            StatementPlan::Execute {
+                command: "SELECT",
+                row_count: RowCountPolicy::Omit
+            }
         );
     }
 
@@ -405,5 +900,13 @@ mod tests {
             classify_statement("COMMIT"),
             StatementPlan::ClientTransactionEnd { command: "COMMIT" }
         );
+        assert!(matches!(
+            classify_statement("ROLLBACK TO SAVEPOINT s1"),
+            StatementPlan::Reject { message, .. } if message.contains("no Exasol equivalent")
+        ));
+        assert!(matches!(
+            classify_statement("COMMIT PREPARED 'x'"),
+            StatementPlan::Reject { message, .. } if message.contains("no Exasol equivalent")
+        ));
     }
 }

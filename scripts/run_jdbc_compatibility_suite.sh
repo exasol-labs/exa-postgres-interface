@@ -10,7 +10,7 @@ Example:
     'jdbc:postgresql://127.0.0.1:15432/exasol?preferQueryMode=extended' \
     sys \
     'EXASOL_PASSWORD' \
-    --personas=baseline,metabase,dbeaver
+    --personas=baseline,metabase,dbeaver,dml,ddl,transaction,session,utility
 USAGE
     exit 1
 fi

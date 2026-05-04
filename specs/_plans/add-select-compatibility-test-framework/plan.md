@@ -7,12 +7,12 @@ preprocessor compatibility changes.
 
 ## Objective
 
-Build a reusable compatibility test framework for the read-only PostgreSQL gateway so the team can answer three questions with one run:
+Build a reusable compatibility test framework for the PostgreSQL gateway so the team can answer these questions with one run:
 
 * Which JDBC `DatabaseMetaData` methods work, fail, or degrade through the gateway?
-* Which PostgreSQL-flavored `SELECT` queries work for realistic client personas such as DbVisualizer, pgJDBC, Metabase, and DBeaver?
-* Which unsupported query families should be treated as implementation gaps instead of one-off smoke-test misses?
-* How much latency overhead does the PostgreSQL gateway add for small and medium read-only queries compared with a direct Exasol JDBC connection?
+* Which PostgreSQL-flavored statement families work for realistic client personas such as DbVisualizer, pgJDBC, Metabase, and DBeaver?
+* Which unsupported DQL, DML, DDL, transaction, session, and utility operations should be treated as implementation gaps instead of one-off smoke-test misses?
+* How much latency overhead does the PostgreSQL gateway add for representative read-heavy workloads compared with a direct Exasol JDBC connection?
 
 The framework SHOULD favor discovery and reporting over brittle pass/fail assertions. It MUST keep a small must-pass baseline for regression detection, but it SHOULD also run exploratory probes that surface unsupported PostgreSQL queries without freezing the current limitations into unit tests.
 
@@ -26,12 +26,12 @@ There are no permanent testing specs yet. This plan introduces a staged testing 
 
 ## User-Side Scope Decisions
 
-* Scope remains limited to read-only `SELECT` behavior plus JDBC metadata reads.
-* The framework SHOULD test current behavior without assuming full PostgreSQL semantics.
+* Scope now includes JDBC metadata plus PostgreSQL DQL, DML, DDL, transaction control, session, and utility statement families.
+* The framework SHOULD test current behavior without assuming full PostgreSQL semantics or full write support.
 * The framework SHOULD separate must-pass baseline probes from exploratory compatibility probes.
 * The framework SHOULD reflect real client behavior drawn from open-source PostgreSQL tooling.
-* The framework SHOULD make unsupported query families visible in one report instead of stopping at the first failure.
-* The framework SHOULD include a latency benchmark that compares gateway execution against direct Exasol JDBC for logically equivalent read-only queries.
+* The framework SHOULD make unsupported statement families visible in one report instead of stopping at the first failure.
+* The framework SHOULD include a latency benchmark that compares gateway execution against direct Exasol JDBC for logically equivalent read-heavy queries.
 
 ## Research Inputs
 
@@ -60,7 +60,10 @@ The persona corpus should be informed by real client implementations and docs:
    * pgJDBC metadata-helper queries;
    * Metabase-style metadata and `LIMIT 0` / `LIMIT 1` query-metadata probes;
    * DBeaver-style schema browser queries;
-   * analyst-oriented PostgreSQL-flavored `SELECT` stress cases.
+   * analyst-oriented PostgreSQL-flavored `SELECT` stress cases;
+   * DML probes such as `INSERT`, `UPDATE`, `DELETE`, and `MERGE`;
+   * DDL probes such as `CREATE`, `ALTER`, `TRUNCATE`, and `DROP`;
+   * transaction/session/utility probes such as `BEGIN`, `SAVEPOINT`, `SET`, `SHOW`, `EXPLAIN`, `COPY`, `VACUUM`, and `ANALYZE`.
 4. Add a run script that compiles and executes the compatibility suite against a supplied JDBC URL and credentials.
 5. Add a gateway-vs-direct Exasol benchmark that:
    * runs a small set of logically equivalent small and medium read-only query pairs;
@@ -82,7 +85,7 @@ Manual verification SHOULD include:
 
 * running the compatibility suite against a live gateway with `preferQueryMode=extended`;
 * reviewing the must-pass baseline failures separately from exploratory failures;
-* reviewing which metadata methods and query families fail with clear SQLState/message details.
+* reviewing which metadata methods and statement families fail with clear SQLState/message details.
 * running the latency benchmark against both the gateway and a direct Exasol JDBC endpoint with the same sample data.
 * reviewing gateway/direct timing ratios for the documented small and medium query pairs.
 
@@ -92,5 +95,5 @@ Manual verification SHOULD include:
 * The local environment might not have a JDK; the framework should still be check-in ready with a clear run script and docs.
 * DBeaver and pgJDBC both use richer catalog surfaces than the current smoke coverage, so the first report may show many exploratory failures.
 * Metabase behavior is partly inferred from public driver docs and JDBC patterns, so the corpus should be treated as representative, not exhaustive.
-* Small-data latency benchmarks will mostly measure protocol and driver overhead, not heavy analytical execution cost.
+* Read-heavy latency benchmarks will mostly measure protocol and driver overhead unless they are paired with longer analytical queries.
 * For fairness, gateway and direct Exasol benchmarks need logically equivalent query pairs, not identical SQL text.
