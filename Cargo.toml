@@ -1,6 +1,6 @@
 [package]
 name = "exa-postgres-interface"
-version = "0.2.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.89"
 default-run = "exa-postgres-interface"
@@ -12,8 +12,10 @@ byteorder = "1"
 futures = "0.3"
 native-tls = "0.2"
 pgwire = { version = "0.39", features = ["server-api-aws-lc-rs"] }
+polyglot-sql = "0.3.5"
 rand = "0.8"
 regex = "1"
+rpassword = "7"
 rsa = "0.9"
 rustls-pemfile = "2"
 rustls-pki-types = "1"

@@ -2,177 +2,146 @@
 
 `exa-postgres-interface` is a PostgreSQL wire-protocol gateway for Exasol. It
 lets PostgreSQL-capable tools connect to Exasol through a PostgreSQL-compatible
-listener while Exasol remains the actual database engine.
+listener while Exasol remains the database engine.
 
-The gateway is a Rust binary built on `pgwire`. It accepts PostgreSQL client
-connections, opens one Exasol WebSocket session per client, initializes that
-session with an Exasol-side SQL preprocessor, and returns Exasol results using
-PostgreSQL protocol messages.
+The goal is compatibility, not PostgreSQL emulation. The gateway exposes the
+PostgreSQL protocol and PostgreSQL-shaped metadata where that helps existing
+tools work with Exasol. SQL execution, storage, privileges, optimizer behavior,
+and durable metadata remain Exasol behavior.
 
-PostgreSQL SQL translation and PostgreSQL catalog compatibility are centered in
-Exasol:
+## What Is In This Repository
 
-* `sql/postgres_catalog_compatibility.sql` creates `PG_CATALOG` and
-  `INFORMATION_SCHEMA` compatibility schemas.
-* `sql/exasol_sql_preprocessor.sql` installs `PG_DEMO.PG_SQL_PREPROCESSOR`,
-  which rewrites PostgreSQL-flavored SQL and metadata probes before Exasol
-  executes them.
-* The gateway handles protocol behavior, authentication forwarding, session
-  setup, TLS policy, capability-based statement routing, and PostgreSQL
-  client/session commands.
+This repository contains:
 
-## Current Status
+* a Rust gateway binary built on `pgwire`;
+* a PostgreSQL-to-Exasol SQL translation layer using `polyglot-sql` plus local
+  compatibility rewrites;
+* Exasol-side `PG_CATALOG` and `INFORMATION_SCHEMA` compatibility objects;
+* an interactive first-run installer for generating config and installing the
+  catalog compatibility layer;
+* a systemd service template;
+* smoke, JDBC compatibility, metadata compatibility, and benchmark tooling.
 
-Implemented:
+The normal runtime path does not require an Exasol SQL preprocessor. An optional
+legacy fallback preprocessor is still available as `PG_CATALOG.PG_SQL_PREPROCESSOR`
+for migration scenarios.
 
-* PostgreSQL startup and cleartext password authentication.
-* Simple Query and Extended Query paths for row-returning statements,
-  supported DML, and selected Exasol-equivalent DDL.
-* Per-client direct Exasol WebSocket sessions.
-* Exasol TLS support with normal certificate validation, SHA-256 fingerprint
-  pinning, and a development-only `validate_certificate = false` escape hatch.
-* Exasol-side SQL translation with `sqlglot` through
-  `PG_DEMO.PG_SQL_PREPROCESSOR`.
-* Exasol-side PostgreSQL metadata compatibility schemas:
-  `PG_CATALOG` and `INFORMATION_SCHEMA`.
-* Full documented PostgreSQL 18 `pg_catalog` and `information_schema` relation
-  and column surface, with unsupported objects represented by empty
-  PostgreSQL-shaped views.
-* Mapped metadata for schemas, tables, views, columns, constraints, indexes,
-  roles/users, routines/scripts, and common client catalog helpers where Exasol
-  has useful equivalent metadata.
-* Compatibility fixes for observed DbVisualizer and DBeaver catalog browser
-  queries, including PostgreSQL helper functions and client-specific metadata
-  shapes that use arrays, `LATERAL UNNEST`, tuple joins, and PostgreSQL catalog
-  aliases.
-* JDBC smoke tests, JDBC metadata smoke tests, a broader compatibility suite,
-  and a gateway-vs-direct Exasol benchmark harness.
-* A systemd unit template for Linux service operation.
+## Compatibility Snapshot
 
-Known limits:
+The gateway currently targets common PostgreSQL client workflows such as
+connectivity checks, catalog browsing, JDBC metadata calls, read queries, core
+DML, selected DDL, and basic cursor use. It does not claim full PostgreSQL
+server compatibility.
 
-* DML is enabled for Exasol-backed execution, and selected DDL is enabled for
-  Exasol-equivalent table, view, and schema operations. Broader PostgreSQL
-  object families remain capability-gated.
-* PostgreSQL transaction wrappers are acknowledged for client compatibility;
-  full PostgreSQL transaction semantics, savepoints, and two-phase commit are
-  not implemented.
-* PostgreSQL SQL cursors are implemented as gateway-managed, materialized,
-  read-only cursor state for supported row-returning queries. Binary cursors,
-  updatable cursors, positioned writes, and unbounded/spill-managed cursor
-  policies are not implemented yet.
-* Binary prepared-statement parameters are not implemented.
-* PostgreSQL catalog compatibility is broad enough to expose the documented
-  surface, but many PostgreSQL-only features intentionally return empty rows or
-  `NULL` columns because Exasol has no equivalent object type.
-* Compatibility is strongest for JDBC, DbVisualizer, DBeaver, `psql`, and the
-  tested metadata/browser paths. Other PostgreSQL tools may still expose
-  PostgreSQL-specific metadata or SQL constructs that need additional mapping.
+| Area | Current support | Notes |
+| --- | --- | --- |
+| PostgreSQL wire protocol | Partial | Startup, cleartext password auth, Simple Query, Extended Query, row descriptions, data rows, command tags, and errors are implemented. |
+| Authentication | Pass-through | PostgreSQL username/password are used to authenticate to Exasol. Other auth methods are not implemented. |
+| TLS | Supported | Exasol TLS supports normal validation, certificate fingerprint pinning, and a development-only no-verify mode. PostgreSQL listener TLS is optional. |
+| `SELECT` / DQL | Supported with translation | PostgreSQL-flavored SQL is translated in the gateway before Exasol execution. |
+| DML | Supported where Exasol has equivalent behavior | `INSERT`, `UPDATE`, `DELETE`, `MERGE`, and `TRUNCATE` are capability-routed, but PostgreSQL-specific semantics may still be rejected. |
+| DDL | Selected support | Table, view, schema, and related Exasol-equivalent DDL are enabled. PostgreSQL-only object families remain unsupported. |
+| Transactions | Compatibility wrappers | `BEGIN`, `COMMIT`, and `ROLLBACK` are acknowledged for client compatibility. Full PostgreSQL transaction semantics, savepoints, and two-phase commit are not implemented. |
+| Cursors | Gateway-managed | Materialized read-only SQL cursors are supported for row-returning queries. Binary cursors, updatable cursors, and positioned writes are unsupported. |
+| Prepared statements | Partial | Extended Query protocol is supported. Binary parameters and SQL-level `PREPARE`/`EXECUTE` behavior are not complete. |
+| Metadata | Broad compatibility layer | Exasol-side `PG_CATALOG` and `INFORMATION_SCHEMA` expose PostgreSQL-shaped views/functions backed by Exasol metadata where possible. PostgreSQL-only fields may be empty or `NULL`. |
+| Bulk load/export | Not implemented | PostgreSQL `COPY` needs a separate design because Exasol has different import/export semantics. |
+| PostgreSQL engine features | Unsupported where no Exasol equivalent exists | Extensions, event triggers, rewrite rules, publications/subscriptions, text search objects, access methods, many tablespace behaviors, and similar PostgreSQL-specific features are not exposed as real Exasol features. |
 
-## Deployment Overview
+See the fuller compatibility matrix in
+[docs/compatibility-matrix.md](docs/compatibility-matrix.md). Metadata-specific
+details are in
+[docs/postgres-metadata-compatibility.md](docs/postgres-metadata-compatibility.md).
 
-A normal Linux deployment has four parts:
+## How It Works
 
-1. Install the Exasol-side compatibility SQL.
-2. Install the gateway binary and config on the host.
-3. Register the systemd service.
-4. Open the PostgreSQL listener port to trusted client IPs.
+Each PostgreSQL client connects to the gateway. The gateway opens one Exasol
+WebSocket session for that client and passes the client-supplied username and
+password through to Exasol.
 
-The examples below assume:
+For SQL sent by clients, the gateway:
 
-* gateway install root: `/opt/exa-postgres-interface`
-* config path: `/etc/exa-postgres-interface/config.toml`
-* service user: `exa-postgres-interface`
-* PostgreSQL listener: `0.0.0.0:15432`
-* Exasol endpoint: `EXASOL_HOST:8563`
+1. classifies the statement and rejects unsupported capability families early;
+2. handles PostgreSQL client/session commands locally where appropriate;
+3. translates supported PostgreSQL-flavored SQL to Exasol SQL in Rust;
+4. executes translated SQL through the Exasol WebSocket API;
+5. maps Exasol result sets, update counts, and errors back into PostgreSQL
+   protocol responses.
 
-## Build A Binary
+PostgreSQL metadata compatibility is split between the gateway and Exasol:
 
-Until release artifacts are published, build the binary on a compatible Linux
-host:
+* `sql/postgres_catalog_compatibility.sql` installs `PG_CATALOG` and
+  `INFORMATION_SCHEMA` schemas in Exasol.
+* The gateway translates PostgreSQL metadata probes and client-specific catalog
+  query patterns before execution.
+* Exasol compatibility views and functions return Exasol-backed metadata where
+  an equivalent exists and stable empty/`NULL` PostgreSQL-shaped results where
+  no equivalent exists.
+
+This design keeps installation simpler than the earlier preprocessor approach:
+translation ships with the gateway binary, while database-side objects are
+limited to stable catalog compatibility.
+
+## Installation
+
+Download the current Linux x86_64 release artifact:
 
 ```bash
-cargo build --release
+curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.0.1/exa-postgres-interface-v0.0.1-linux-x86_64.tar.gz
+curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.0.1/exa-postgres-interface-v0.0.1-linux-x86_64.tar.gz.sha256
+sha256sum -c exa-postgres-interface-v0.0.1-linux-x86_64.tar.gz.sha256
+tar -xzf exa-postgres-interface-v0.0.1-linux-x86_64.tar.gz
 ```
 
-The gateway binary will be:
+The extracted release directory contains the gateway binary, a small
+`exasol_exec` SQL helper, reference config, systemd unit, catalog SQL, optional
+fallback preprocessor SQL, and docs:
 
 ```bash
-target/release/exa-postgres-interface
+exa-postgres-interface-v0.0.1-linux-x86_64/
 ```
 
-There is also a development helper binary:
+### Interactive First Run
+
+Run the binary from a terminal:
 
 ```bash
-target/release/exasol_exec
+exa-postgres-interface-v0.0.1-linux-x86_64/bin/exa-postgres-interface --config config/local.toml
 ```
 
-`exasol_exec` is useful for installing and probing Exasol SQL directly, but it
-is not required by the systemd service.
+If the config file does not exist, the gateway prompts for listener and Exasol
+connection settings and writes the TOML config.
 
-## Install Exasol-Side SQL
+After loading the config, it prompts for temporary Exasol setup credentials. The
+prompt reminds the operator that these credentials are used only to check or
+install `PG_CATALOG` and `INFORMATION_SCHEMA`; they are not saved and are not
+used for normal SQL processing. The gateway asks before creating or refreshing
+compatibility objects.
 
-Install the compatibility schemas first:
+After the bootstrap check, the gateway starts listening for PostgreSQL clients.
+
+### Non-Interactive Catalog Install
+
+For automation, install the compatibility objects directly:
 
 ```bash
-python3 scripts/exasol_exec.py \
+exa-postgres-interface-v0.0.1-linux-x86_64/bin/exasol_exec \
   --dsn EXASOL_HOST:8563 \
   --user sys \
   --password 'EXASOL_PASSWORD' \
-  --file sql/postgres_catalog_compatibility.sql
-```
-
-Install the SQL preprocessor:
-
-```bash
-python3 scripts/exasol_exec.py \
-  --dsn EXASOL_HOST:8563 \
-  --user sys \
-  --password 'EXASOL_PASSWORD' \
-  --file sql/exasol_sql_preprocessor.sql
+  --file exa-postgres-interface-v0.0.1-linux-x86_64/sql/postgres_catalog_compatibility.sql
 ```
 
 Verify the installed objects:
 
 ```sql
-SELECT SCRIPT_SCHEMA, SCRIPT_NAME
-FROM SYS.EXA_ALL_SCRIPTS
-WHERE SCRIPT_SCHEMA = 'PG_DEMO'
-  AND SCRIPT_NAME = 'PG_SQL_PREPROCESSOR';
-
-SELECT COUNT(*)
-FROM PG_CATALOG.PG_CLASS;
-
-SELECT COUNT(*)
-FROM INFORMATION_SCHEMA.TABLES;
+SELECT COUNT(*) FROM PG_CATALOG.PG_CLASS;
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES;
 ```
 
-## Install The Gateway Files
+### Configuration
 
-Create the service user and directories:
-
-```bash
-sudo useradd --system --home /opt/exa-postgres-interface --shell /usr/sbin/nologin exa-postgres-interface
-sudo mkdir -p /opt/exa-postgres-interface/bin
-sudo mkdir -p /etc/exa-postgres-interface
-```
-
-Copy the release binary:
-
-```bash
-sudo install -m 0755 target/release/exa-postgres-interface \
-  /opt/exa-postgres-interface/bin/exa-postgres-interface
-```
-
-Create the config:
-
-```bash
-sudo install -m 0640 -o root -g exa-postgres-interface \
-  config/example.toml \
-  /etc/exa-postgres-interface/config.toml
-```
-
-Edit `/etc/exa-postgres-interface/config.toml`:
+The generated or installed config is TOML:
 
 ```toml
 [server]
@@ -180,8 +149,7 @@ listen_host = "0.0.0.0"
 listen_port = 15432
 log_level = "INFO"
 
-# Optional PostgreSQL wire-protocol TLS. Enable this when clients require
-# sslmode=require or equivalent.
+# Optional PostgreSQL wire-protocol TLS.
 # tls_cert_path = "/etc/exa-postgres-interface/server.crt"
 # tls_key_path = "/etc/exa-postgres-interface/server.key"
 
@@ -199,27 +167,37 @@ certificate_fingerprint = "SHA256_HEX_FINGERPRINT"
 
 [translation]
 enabled = true
-sql_preprocessor_script = "PG_DEMO.PG_SQL_PREPROCESSOR"
-session_init_sql = [
-  "ALTER SESSION SET SQL_PREPROCESSOR_SCRIPT = {script}"
-]
 ```
 
-The PostgreSQL client username and password are passed through to Exasol when
-`pass_client_credentials = true`.
+See [config/example.toml](config/example.toml) for the reference config.
 
-## Install systemd Unit
+### systemd
 
-Copy the unit file:
+Create the service user and directories:
 
 ```bash
-sudo install -m 0644 packaging/exa-postgres-interface.service \
+sudo useradd --system --home /opt/exa-postgres-interface --shell /usr/sbin/nologin exa-postgres-interface
+sudo mkdir -p /opt/exa-postgres-interface/bin
+sudo mkdir -p /etc/exa-postgres-interface
+```
+
+Install the binary and config:
+
+```bash
+sudo install -m 0755 exa-postgres-interface-v0.0.1-linux-x86_64/bin/exa-postgres-interface \
+  /opt/exa-postgres-interface/bin/exa-postgres-interface
+sudo install -m 0640 -o root -g exa-postgres-interface \
+  exa-postgres-interface-v0.0.1-linux-x86_64/config/example.toml \
+  /etc/exa-postgres-interface/config.toml
+```
+
+Run the interactive bootstrap once before enabling the service, or install the
+catalog SQL non-interactively. The service uses `--no-bootstrap` so it never
+waits for credentials:
+
+```bash
+sudo install -m 0644 exa-postgres-interface-v0.0.1-linux-x86_64/packaging/exa-postgres-interface.service \
   /etc/systemd/system/exa-postgres-interface.service
-```
-
-Reload systemd and start the service:
-
-```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now exa-postgres-interface
 ```
@@ -231,10 +209,9 @@ systemctl status exa-postgres-interface
 journalctl -u exa-postgres-interface -f
 ```
 
-## Open The Listener Port
+### Network Access
 
-If clients connect from outside the host, the gateway must listen on a reachable
-interface:
+If clients connect from outside the host, set:
 
 ```toml
 [server]
@@ -242,13 +219,36 @@ listen_host = "0.0.0.0"
 listen_port = 15432
 ```
 
-Open TCP `15432` only from trusted client IPs. On AWS, add an inbound security
-group rule for the client source IP or VPN/CIDR. On a Linux firewall, use the
-site's standard firewall tooling to allow the same restricted source.
+Open TCP `15432` only from trusted client IPs or network ranges.
 
-## Connect A PostgreSQL Client
+### Optional Preprocessor Fallback
 
-Use the PostgreSQL driver/connector:
+The default install does not require an Exasol SQL preprocessor. For a migration
+or support scenario that still needs the legacy database-side rewrite path,
+install the fallback script:
+
+```bash
+exa-postgres-interface-v0.0.1-linux-x86_64/bin/exasol_exec \
+  --dsn EXASOL_HOST:8563 \
+  --user sys \
+  --password 'EXASOL_PASSWORD' \
+  --file exa-postgres-interface-v0.0.1-linux-x86_64/sql/exasol_sql_preprocessor.sql
+```
+
+Then enable it explicitly:
+
+```toml
+[translation]
+enabled = true
+sql_preprocessor_script = "PG_CATALOG.PG_SQL_PREPROCESSOR"
+session_init_sql = [
+  "ALTER SESSION SET SQL_PREPROCESSOR_SCRIPT = {script}"
+]
+```
+
+## Usage
+
+Use a PostgreSQL driver or connector:
 
 * host: gateway host
 * port: `15432`
@@ -277,25 +277,7 @@ If the client has a separate SSL toggle, either disable client SSL or configure
 `server.tls_cert_path` and `server.tls_key_path` so the gateway accepts
 PostgreSQL SSLRequest startup packets.
 
-## Sample Data
-
-The sample-data helper uses `EXAPUMP_PROFILE=nc-personal-2` by default:
-
-```bash
-scripts/setup_sample_data.sh
-```
-
-Override the profile when needed:
-
-```bash
-EXAPUMP_PROFILE=other-profile scripts/setup_sample_data.sh
-```
-
-The sample data creates a richer demo environment with users, roles, nested role
-grants, schemas, tables, views, functions, scripts, constraints, and
-cross-schema dependencies so metadata browsers have realistic objects to show.
-
-## Test And Compatibility Checks
+## Development And Testing
 
 Rust checks:
 
@@ -303,6 +285,18 @@ Rust checks:
 cargo fmt --check
 cargo test
 cargo build --release
+```
+
+Sample data:
+
+```bash
+scripts/setup_sample_data.sh
+```
+
+Override the default Exapump profile when needed:
+
+```bash
+EXAPUMP_PROFILE=other-profile scripts/setup_sample_data.sh
 ```
 
 JDBC smoke:
@@ -337,11 +331,25 @@ scripts/run_gateway_vs_exasol_benchmark.sh \
   'EXASOL_PASSWORD'
 ```
 
-See:
+Related docs:
 
+* [docs/compatibility-matrix.md](docs/compatibility-matrix.md)
 * [docs/smoke-test.md](docs/smoke-test.md)
 * [docs/postgres-metadata-compatibility.md](docs/postgres-metadata-compatibility.md)
 * [docs/client-compatibility-test-framework.md](docs/client-compatibility-test-framework.md)
+
+## Release Packaging
+
+Published releases include:
+
+* `exa-postgres-interface-vX.Y.Z-linux-x86_64.tar.gz`
+* `exa-postgres-interface-vX.Y.Z-linux-x86_64.tar.gz.sha256`
+
+Release archives are built by [scripts/package_release.sh](scripts/package_release.sh)
+and published by the GitHub Actions release workflow when a `v*` tag is pushed.
+The archive contains the Linux gateway binary, the `exasol_exec` helper,
+reference config, systemd unit, SQL compatibility files, and key docs so end
+users do not need Rust or Cargo.
 
 ## Performance Notes
 
@@ -359,18 +367,3 @@ Observed on the current benchmark host:
 
 Re-run the benchmark in the target environment before treating these numbers as
 acceptance criteria.
-
-## Release Binary Plan
-
-The repository currently supports building a Linux release binary with Cargo.
-The intended distribution shape is:
-
-* publish `exa-postgres-interface` as a Linux release artifact on GitHub;
-* include checksums;
-* keep `packaging/exa-postgres-interface.service` as the reference systemd
-  unit;
-* install the binary under `/opt/exa-postgres-interface/bin`;
-* keep secrets and deployment-specific config under `/etc/exa-postgres-interface`.
-
-Release automation is not implemented yet. Until then, build from source on a
-compatible Linux host and install the resulting `target/release` binary.

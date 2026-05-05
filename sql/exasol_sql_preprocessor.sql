@@ -1,15 +1,15 @@
--- Prototype SQL preprocessor script for Exasol-side PostgreSQL-to-Exasol translation.
+-- Optional SQL preprocessor fallback for PostgreSQL-to-Exasol translation.
 --
 -- Install this only in an Exasol environment whose Python script language
 -- includes sqlglot. The exact SQL preprocessor callback contract can vary by
 -- Exasol version and deployment; keep the activation SQL configurable in
 -- config/example.toml until the target system is fixed.
 
-CREATE SCHEMA IF NOT EXISTS pg_demo;
+CREATE SCHEMA IF NOT EXISTS PG_CATALOG;
 
 ALTER SESSION SET SQL_PREPROCESSOR_SCRIPT = NULL;
 
-CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT pg_demo.pg_sql_preprocessor AS
+CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT PG_CATALOG.PG_SQL_PREPROCESSOR AS
 import re
 
 ILIKE_RE = re.compile(
@@ -161,6 +161,9 @@ FUNCTION_REPLACEMENTS = {
     re.compile(r"(?i)(?<![\w.\"])\bpg_encoding_to_char\s*\("): "PG_CATALOG.PG_ENCODING_TO_CHAR(",
     re.compile(r"(?i)(?<![\w.\"])\bpg_total_relation_size\s*\("): "PG_CATALOG.PG_TOTAL_RELATION_SIZE(",
     re.compile(r"(?i)(?<![\w.\"])\bpg_relation_size\s*\("): "PG_CATALOG.PG_RELATION_SIZE(",
+    re.compile(r"(?i)(?<![\w.\"])\bpg_size_pretty\s*\("): "PG_CATALOG.PG_SIZE_PRETTY(",
+    re.compile(r"(?i)(?<![\w.\"])\bpg_tablespace_size\s*\("): "PG_CATALOG.PG_TABLESPACE_SIZE(",
+    re.compile(r"(?i)(?<![\w.\"])\bpg_tablespace_location\s*\("): "PG_CATALOG.PG_TABLESPACE_LOCATION(",
     re.compile(r"(?i)(?<![\w.\"])\bpg_stat_get_numscans\s*\("): "PG_CATALOG.PG_STAT_GET_NUMSCANS(",
     re.compile(r"(?i)(?<![\w.\"])\bpg_stat_get_blocks_fetched\s*\("): "PG_CATALOG.PG_STAT_GET_BLOCKS_FETCHED(",
     re.compile(r"(?i)(?<![\w.\"])\bpg_stat_get_blocks_hit\s*\("): "PG_CATALOG.PG_STAT_GET_BLOCKS_HIT(",
@@ -191,6 +194,10 @@ def normalize_ansi_quoted_postgres_identifiers(sql):
         lambda match: "{} {}".format(match.group(1), match.group(2)),
         sql,
     )
+    sql = JOIN_PREFIX_RE.sub(
+        lambda match: "{}{}".format(match.group(1), match.group(2)),
+        sql,
+    )
     return sql
 
 def extract_in_filter(sql, source_column, target_column):
@@ -201,6 +208,22 @@ def extract_in_filter(sql, source_column, target_column):
     if not match:
         return ""
     return " AND {} IN ({})".format(target_column, match.group(1).strip())
+
+def extract_eq_filter(sql, source_column, target_column):
+    pattern = re.compile(
+        r"(?is)\b{}\s*=\s*('(?:''|[^'])*'|[A-Za-z_][A-Za-z0-9_.]*)".format(
+            re.escape(source_column)
+        )
+    )
+    match = pattern.search(sql)
+    if not match:
+        return ""
+    return " AND {} = {}".format(target_column, match.group(1).strip())
+
+def extract_in_or_eq_filter(sql, source_column, target_column):
+    return extract_in_filter(sql, source_column, target_column) or extract_eq_filter(
+        sql, source_column, target_column
+    )
 
 def rewrite_known_metadata_query(sql):
     sql = normalize_ansi_quoted_postgres_identifiers(sql)
@@ -307,6 +330,33 @@ WHERE C.CONSTRAINT_TYPE = 'FOREIGN KEY'
 {schema_filter}
 {table_filter}
 ORDER BY "fk-table-schema", "fk-table-name"
+""".format(schema_filter=schema_filter, table_filter=table_filter)
+    if (
+        "information_schema._pg_expandarray" in normalized
+        and "pg_index" in normalized
+        and "i.indisprimary" in normalized
+        and "key_seq" in normalized
+        and "pk_name" in normalized
+    ):
+        schema_filter = extract_in_or_eq_filter(sql, "n.nspname", "CC.CONSTRAINT_SCHEMA")
+        table_filter = extract_in_or_eq_filter(sql, "ct.relname", "CC.CONSTRAINT_TABLE")
+        return """
+SELECT
+    'exasol' AS "TABLE_CAT",
+    CC.CONSTRAINT_SCHEMA AS "TABLE_SCHEM",
+    CC.CONSTRAINT_TABLE AS "TABLE_NAME",
+    CC.COLUMN_NAME AS "COLUMN_NAME",
+    CC.ORDINAL_POSITION AS "KEY_SEQ",
+    CC.CONSTRAINT_NAME AS "PK_NAME"
+FROM SYS.EXA_DBA_CONSTRAINT_COLUMNS CC
+JOIN SYS.EXA_DBA_CONSTRAINTS C
+  ON C.CONSTRAINT_SCHEMA = CC.CONSTRAINT_SCHEMA
+ AND C.CONSTRAINT_TABLE = CC.CONSTRAINT_TABLE
+ AND C.CONSTRAINT_NAME = CC.CONSTRAINT_NAME
+WHERE C.CONSTRAINT_TYPE = 'PRIMARY KEY'
+{schema_filter}
+{table_filter}
+ORDER BY CC.CONSTRAINT_TABLE, CC.CONSTRAINT_NAME, CC.ORDINAL_POSITION
 """.format(schema_filter=schema_filter, table_filter=table_filter)
     if (
         "information_schema._pg_expandarray" in normalized

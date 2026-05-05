@@ -6,7 +6,9 @@ Replace the earlier read-only prototype scope with a capability-driven PostgreSQ
 
 The objective is not full PostgreSQL emulation. Exasol remains the executing database and source of truth. PostgreSQL syntax, protocol responses, metadata, and client workflow behavior are compatibility surfaces layered over Exasol behavior.
 
-This plan is design and specification work only. It SHALL NOT require source-code implementation.
+This plan is design and specification work first. Implementation MAY proceed only after the capability and translator ownership boundaries are clear.
+
+The administration model is now a first-class goal. The default installation path SHOULD minimize required Exasol-side script installation and per-session preprocessor configuration. The preferred target architecture is gateway-owned PostgreSQL-to-Exasol translation in Rust, with Exasol-side compatibility SQL limited to stable metadata views/functions that cannot be owned cleanly by the gateway.
 
 ## Relevant Existing Specs
 
@@ -29,6 +31,10 @@ Primary sources used for the compatibility design:
 * Exasol SQL preprocessor documentation: <https://docs.exasol.com/saas/database_concepts/sql_preprocessor.htm>
 * Polyglot repository and package docs: <https://github.com/tobilg/polyglot>, <https://pypi.org/project/polyglot-sql/>, <https://polyglot.gh.tobilg.com/>
 * SQLGlot documentation: <https://sqlglot.com/sqlglot.html>
+
+Follow-up research as of 2026-05-05 confirms Polyglot is positioned as a Rust/WASM SQL transpilation library with PostgreSQL and Exasol dialect names. This makes it a plausible Rust gateway dependency, but the project MUST still prove PostgreSQL-to-Exasol fixture parity for the observed client queries before making it the default translator.
+
+Spike result as of 2026-05-05: `translation/polyglot-sqlglot-spike.md` shows raw Polyglot is not a drop-in replacement for the current SQLGlot preprocessor because current compatibility depends on project-owned rewrites. Polyglot plus the current rewrite pipeline is viable enough to continue as the preferred gateway-layer candidate.
 
 ## Compatibility Model
 
@@ -88,6 +94,35 @@ Gateway-managed cursor design principles:
 * Updatable cursors, `FOR UPDATE`, `FOR SHARE`, `WHERE CURRENT OF`, and positioned `UPDATE`/`DELETE` SHOULD remain unsupported until row identity, locking, and Exasol write semantics are specified.
 * Cursor memory, row-count, timeout, and spill-to-disk limits MUST be explicit configuration or documented server policy.
 
+## Installation And Administration Direction
+
+The current deployment requires:
+
+* Installing a gateway binary and systemd configuration.
+* Installing Exasol-side `PG_CATALOG` and `INFORMATION_SCHEMA` compatibility SQL.
+* Earlier prototypes also installed `PG_DEMO.PG_SQL_PREPROCESSOR`.
+* Ensuring each Exasol session activates the SQL preprocessor.
+* Debugging translated SQL through Exasol preprocessor audit behavior.
+
+This is too complex for a customer-facing installation path. The revised target SHOULD reduce required database administration to one stable compatibility SQL bundle, or eventually no database-side objects for clients that do not need PostgreSQL catalog compatibility beyond gateway-provided responses.
+
+The preferred target architecture is:
+
+* Gateway owns statement classification, PostgreSQL-to-Exasol dialect translation, client-specific metadata query rewrites, unsupported capability errors, and translation diagnostics.
+* Exasol owns actual SQL execution and durable metadata.
+* Exasol-side compatibility SQL owns stable PostgreSQL-shaped catalog views/functions only when a client query should execute normally against database metadata.
+* Exasol-side SQL preprocessing becomes optional fallback, not the standard path; when present, the fallback object SHOULD be `PG_CATALOG.PG_SQL_PREPROCESSOR`, not `PG_DEMO`.
+* The gateway binary SHOULD support an interactive first-run bootstrap that creates a config file, asks for one-time setup credentials without saving them, checks/installs compatibility schemas with permission, and prints systemd service guidance.
+
+The migration SHOULD port existing edge-case logic from the legacy SQL preprocessor into a gateway translation pipeline:
+
+1. Normalize PostgreSQL identifier and catalog-reference forms.
+2. Match known client metadata query families before generic transpilation.
+3. Transpile general SQL using `polyglot-sql` when fixture coverage is sufficient.
+4. Apply project-owned Exasol edge-case rewrites that are not handled by Polyglot.
+5. Reject unsafe or unsupported syntax before sending SQL to Exasol.
+6. Log the original SQL, classification result, translation owner, rewritten SQL fingerprint, and failure stage.
+
 ## Translator Architecture Evaluation
 
 The current implementation uses an Exasol-side Python preprocessor based on `sqlglot`. The broader read/write scope reopens this decision.
@@ -110,7 +145,6 @@ The current implementation uses an Exasol-side Python preprocessor based on `sql
 
 * Rust core, C FFI, Python bindings, and TypeScript/WASM bindings.
 * Supports both PostgreSQL and Exasol dialect names.
-* Latest researched release is `polyglot-sql` 0.3.5 on PyPI, released April 29, 2026.
 * Native Rust integration could move translation into the application layer and avoid a Python preprocessor dependency for new behavior.
 * The project reports broad SQLGlot fixture compatibility and includes guard rails for parser/formatter resource limits.
 
@@ -123,11 +157,13 @@ The current implementation uses an Exasol-side Python preprocessor based on `sql
 
 Recommendation for the spec:
 
+* Prefer gateway-owned translation for user experience and administration simplicity.
 * Do not replace `sqlglot` immediately by specification alone.
-* Add a translator abstraction to the design with required behavior and tests.
-* Evaluate `polyglot-sql` as an application-layer candidate using the command-level compatibility matrix.
-* Prefer a hybrid path only if it has a clear split of responsibility, for example gateway-managed cursors and command classification in Rust, with Exasol-side preprocessing retained for proven metadata rewrites.
-* Require a fixture suite comparing `sqlglot`, `polyglot-sql`, and direct Exasol execution before selecting a new default.
+* Add a translator abstraction to the gateway design with required behavior, diagnostics, and tests.
+* Evaluate `polyglot-sql` as the default application-layer candidate using the command-level compatibility matrix and observed client-query fixtures.
+* Treat the current Exasol-side `sqlglot` preprocessor as a migration source and fallback, not as the long-term default.
+* Prefer a hybrid path only as a temporary migration stage with clear ownership boundaries.
+* Require a fixture suite comparing current preprocessor output, Polyglot output, and direct Exasol execution before selecting a new default.
 
 ## Proposed Spec Deltas
 
@@ -137,6 +173,10 @@ Recommendation for the spec:
   * Defines the compatibility matrix and PostgreSQL-to-Exasol syntax/function mapping requirements.
 * `translation/translator-engine-selection/spec.md`
   * Defines how SQLGlot, Polyglot, and hybrid translation options are evaluated before implementation.
+* `translation/polyglot-sqlglot-spike.md`
+  * Records the initial Polyglot versus SQLGlot parity spike and recommendation.
+* `operations/gateway-owned-translation/spec.md`
+  * Defines the simplified installation/admin model and the migration away from required Exasol-side SQL preprocessing.
 
 ## Design Tasks
 
@@ -163,9 +203,16 @@ Recommendation for the spec:
 5. Evaluate translator engine options.
    * Run representative DQL, DML, DDL, transaction, and metadata fixtures through SQLGlot and Polyglot.
    * Compare produced SQL with Exasol parser/execution behavior.
-   * Decide whether translation remains Exasol-side, moves application-side, or becomes hybrid.
+   * Decide whether Polyglot plus gateway edge-case rewrites can become the default application-side translation path.
+   * Define the migration path for removing `PG_DEMO.PG_SQL_PREPROCESSOR` from standard installation.
 
-6. Define compatibility tests before implementation.
+6. Design simplified installation and administration.
+   * Define the minimum database objects required for client compatibility.
+   * Define idempotent install/upgrade/uninstall flows.
+   * Define a no-preprocessor session initialization path.
+   * Define diagnostics that replace Exasol preprocessor audit visibility.
+
+7. Define compatibility tests before implementation.
    * Tests SHOULD include direct Exasol control statements and gateway PostgreSQL statements.
    * Tests SHOULD include positive and negative cases for every supported statement family.
    * Tests MUST include unsupported PostgreSQL-only syntax returning clear errors.
@@ -179,6 +226,8 @@ Spec verification SHOULD include:
 * Validate that every unsupported family states `unsupported-no-equivalent` or `unsupported-policy`.
 * Confirm cursor scenarios cover `DECLARE`, `FETCH`, `MOVE`, `CLOSE`, holdability, scrollability, and cleanup.
 * Confirm translator selection scenarios require direct comparison against Exasol execution before any engine switch.
+* Confirm installation scenarios distinguish required gateway config from optional database-side compatibility objects.
+* Confirm the default path no longer requires installing or enabling an Exasol-side SQL preprocessor once gateway-owned translation is implemented.
 
 No implementation tests are required for this design-only plan.
 
@@ -189,6 +238,8 @@ No implementation tests are required for this design-only plan.
 * PostgreSQL clients may depend on cursors and prepared statements through both SQL commands and wire-protocol portals. These should be designed together.
 * Broad write support raises safety expectations: transaction state, partial failure, autocommit, update counts, DDL commits, and privilege errors become client-visible.
 * The SQL translation engine may become a product dependency. Maturity, release cadence, extensibility, error reporting, resource controls, and Exasol dialect fidelity matter more than raw syntax coverage claims.
+* Moving translation into the gateway improves installation ergonomics but reduces Exasol audit visibility of original preprocessor transformations. Gateway logs and diagnostics must replace that operational signal.
+* The current preprocessor contains valuable client-specific edge-case behavior discovered through DBVisualizer, DBeaver, Qlik, Metabase, and JDBC testing. Migration must port behavior deliberately, not discard it.
 
 ## Open Decisions
 
@@ -198,5 +249,6 @@ No implementation tests are required for this design-only plan.
 * Should transaction state be backed by Exasol autocommit control, local protocol compatibility, or both?
 * Should cursors materialize all rows, stream rows with bounded buffering, or support both modes?
 * What cursor result-size limit is acceptable for a systemd-managed gateway process?
-* Should `polyglot-sql` be evaluated as a Rust dependency, Python replacement in the Exasol preprocessor, or both?
-* How should current Exasol-side metadata rewrites be shared if translation moves into the application layer?
+* Can `polyglot-sql` become the default Rust dependency for application-layer translation?
+* Which current Exasol-side metadata rewrites should become first-class gateway rewrite rules, and which should remain in Exasol compatibility views/functions?
+* What database objects should remain mandatory after the SQL preprocessor is removed from the standard path?

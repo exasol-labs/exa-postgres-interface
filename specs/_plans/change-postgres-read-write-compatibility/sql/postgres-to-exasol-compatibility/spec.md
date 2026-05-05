@@ -8,6 +8,7 @@ The project SHALL maintain a PostgreSQL-to-Exasol compatibility matrix that maps
 * Exasol documentation is the source of truth for supported Exasol statements, functions, data types, SQL standard features, and documented limitations.
 * Exasol supports core read, write, DDL, privilege, and transaction statements, but its syntax and behavior are not identical to PostgreSQL.
 * Translation failures, unsupported PostgreSQL features, and Exasol execution failures are separate outcomes.
+* The preferred translation owner is the gateway application layer, not an Exasol-side SQL preprocessor.
 
 ## Scenarios
 
@@ -59,6 +60,25 @@ The project SHALL maintain a PostgreSQL-to-Exasol compatibility matrix that maps
 * *WHEN* the compatibility matrix marks it supported
 * *THEN* the matrix SHALL identify the Exasol function, operator, cast, or rewrite pattern
 * *AND* the translation SHALL reject type-sensitive rewrites unless the required type context is available or the rewrite is proven safe without it
+* *AND* gateway-owned translation SHOULD apply the rewrite before Exasol execution so the standard path does not depend on a SQL preprocessor
+
+<!-- DELTA:NEW -->
+### Scenario: Client metadata edge cases are tracked as compatibility capabilities
+
+* *GIVEN* a PostgreSQL-compatible client emits metadata SQL that uses PostgreSQL-specific syntax
+* *WHEN* the query is required for a supported client workflow
+* *THEN* the compatibility matrix SHOULD record the query family, client source, PostgreSQL construct, Exasol equivalent, and translation owner
+* *AND* observed client-specific fixes SHALL be covered by fixtures before they are moved from the Exasol-side preprocessor into the gateway
+* *AND* unsupported PostgreSQL metadata constructs SHALL return stable empty or `NULL` compatibility responses only when that behavior is documented
+
+<!-- DELTA:NEW -->
+### Scenario: Gateway translation preserves Exasol audit usefulness
+
+* *GIVEN* the gateway sends already-translated SQL to Exasol
+* *WHEN* an operator investigates failures through `EXA_DBA_AUDIT_SQL`
+* *THEN* the Exasol audit table SHALL show the SQL sent to Exasol
+* *AND* gateway diagnostics SHOULD correlate the Exasol session and statement with the original PostgreSQL SQL and translation phases
+* *AND* the system SHALL document that Exasol audit no longer contains SQL preprocessor comments when preprocessor fallback is disabled
 
 <!-- DELTA:NEW -->
 ### Scenario: Bulk data movement requires a separate design

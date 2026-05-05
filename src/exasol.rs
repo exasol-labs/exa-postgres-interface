@@ -109,7 +109,7 @@ impl ExasolSession {
     ) -> Result<(), ExasolError> {
         for template in session_init_sql {
             let sql = template.replace("{script}", script);
-            tracing::info!("initializing Exasol session SQL preprocessor");
+            tracing::info!("running configured Exasol session initialization SQL");
             self.execute(&sql)?;
         }
         Ok(())

@@ -38,6 +38,7 @@ use crate::policy::{
     CursorClose, CursorDeclare, CursorDirection, CursorPlan, CursorPosition, RowCountPolicy,
     StatementPlan, classify_statement,
 };
+use crate::translator::translate_postgres_to_exasol;
 
 struct SessionState {
     exasol: Mutex<ExasolSession>,
@@ -203,7 +204,7 @@ impl ExasolPgWireHandler {
                     .session_extensions()
                     .get::<SessionState>()
                     .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
-                let sql = rewrite_exasol_edge_case_sql(sql);
+                let sql = self.translate_client_sql(sql)?;
                 let result = task::spawn_blocking(move || {
                     let mut session = state.exasol.lock().map_err(|_| {
                         ExasolError::Connection("Exasol session lock poisoned".to_owned())
@@ -272,7 +273,7 @@ impl ExasolPgWireHandler {
             }
         }
 
-        let result = self.execute_exasol_sql(client, &declare.query).await?;
+        let result = self.execute_client_sql(client, &declare.query).await?;
         let ExasolResult::ResultSet { columns, rows } = result else {
             return Ok(vec![GatewayResponse::Error {
                 sqlstate: "0A000".to_owned(),
@@ -751,7 +752,7 @@ impl ExasolPgWireHandler {
             .session_extensions()
             .get::<SessionState>()
             .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
-        let sql = rewrite_exasol_edge_case_sql(sql);
+        let sql = sql.to_owned();
         task::spawn_blocking(move || {
             let mut session = state
                 .exasol
@@ -762,6 +763,36 @@ impl ExasolPgWireHandler {
         .await
         .map_err(|err| pg_error("58000", format!("Exasol execution task failed: {err}")))?
         .map_err(map_exasol_execution_error)
+    }
+
+    async fn execute_client_sql<C>(&self, client: &mut C, sql: &str) -> PgWireResult<ExasolResult>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let sql = self.translate_client_sql(sql)?;
+        self.execute_exasol_sql(client, &sql).await
+    }
+
+    fn translate_client_sql(&self, sql: &str) -> PgWireResult<String> {
+        if !self.config.translation.enabled {
+            return Ok(sql.to_owned());
+        }
+
+        let translated = translate_postgres_to_exasol(sql).map_err(|err| {
+            warn!(%err, sql = %sql, "PostgreSQL-to-Exasol translation failed");
+            pg_error("XX000", err.to_string())
+        })?;
+        if translated != sql {
+            debug!(
+                original_sql = %sql,
+                translated_sql = %translated,
+                "translated PostgreSQL SQL in gateway"
+            );
+        }
+        Ok(translated)
     }
 
     async fn execute_simple_query<C>(
@@ -795,6 +826,7 @@ impl ExasolPgWireHandler {
     }
 }
 
+#[cfg(test)]
 fn rewrite_exasol_edge_case_sql(sql: &str) -> String {
     let normalized = sql
         .split_whitespace()

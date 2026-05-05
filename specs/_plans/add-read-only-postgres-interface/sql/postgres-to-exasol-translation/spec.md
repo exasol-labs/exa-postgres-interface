@@ -9,7 +9,8 @@ Future target scope note: this feature spec describes the implemented
 read-only translation baseline. The next design direction is defined in
 `specs/_plans/change-postgres-read-write-compatibility/` and broadens
 translation requirements to capability-based read/write PostgreSQL
-compatibility.
+compatibility. That follow-up direction also targets gateway-owned translation
+to reduce installation and administration complexity.
 
 Read-only SQL sent by PostgreSQL-compatible clients SHOULD be converted from PostgreSQL dialect to Exasol dialect through an Exasol-side Python preprocessor based on `sqlglot`. Translation behavior SHALL be observable enough to debug failed conversion or execution.
 
