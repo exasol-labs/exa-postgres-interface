@@ -89,10 +89,10 @@ Download the current Linux x86_64 release artifact. The binary is built for
 versions:
 
 ```bash
-curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.0.2/exa-postgres-interface-v0.0.2-linux-x86_64.tar.gz
-curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.0.2/exa-postgres-interface-v0.0.2-linux-x86_64.tar.gz.sha256
-sha256sum -c exa-postgres-interface-v0.0.2-linux-x86_64.tar.gz.sha256
-tar -xzf exa-postgres-interface-v0.0.2-linux-x86_64.tar.gz
+curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.0.3/exa-postgres-interface-v0.0.3-linux-x86_64.tar.gz
+curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.0.3/exa-postgres-interface-v0.0.3-linux-x86_64.tar.gz.sha256
+sha256sum -c exa-postgres-interface-v0.0.3-linux-x86_64.tar.gz.sha256
+tar -xzf exa-postgres-interface-v0.0.3-linux-x86_64.tar.gz
 ```
 
 The extracted release directory contains the gateway binary, a small
@@ -100,7 +100,7 @@ The extracted release directory contains the gateway binary, a small
 fallback preprocessor SQL, and docs:
 
 ```bash
-exa-postgres-interface-v0.0.2-linux-x86_64/
+exa-postgres-interface-v0.0.3-linux-x86_64/
 ```
 
 ### Interactive First Run
@@ -108,7 +108,7 @@ exa-postgres-interface-v0.0.2-linux-x86_64/
 Run the binary from a terminal:
 
 ```bash
-exa-postgres-interface-v0.0.2-linux-x86_64/bin/exa-postgres-interface --config config/local.toml
+exa-postgres-interface-v0.0.3-linux-x86_64/bin/exa-postgres-interface --config config/local.toml
 ```
 
 If the config file does not exist, the gateway prompts for listener and Exasol
@@ -127,11 +127,11 @@ After the bootstrap check, the gateway starts listening for PostgreSQL clients.
 For automation, install the compatibility objects directly:
 
 ```bash
-exa-postgres-interface-v0.0.2-linux-x86_64/bin/exasol_exec \
+exa-postgres-interface-v0.0.3-linux-x86_64/bin/exasol_exec \
   --dsn EXASOL_HOST:8563 \
   --user sys \
   --password 'EXASOL_PASSWORD' \
-  --file exa-postgres-interface-v0.0.2-linux-x86_64/sql/postgres_catalog_compatibility.sql
+  --file exa-postgres-interface-v0.0.3-linux-x86_64/sql/postgres_catalog_compatibility.sql
 ```
 
 Verify the installed objects:
@@ -186,10 +186,10 @@ sudo mkdir -p /etc/exa-postgres-interface
 Install the binary and config:
 
 ```bash
-sudo install -m 0755 exa-postgres-interface-v0.0.2-linux-x86_64/bin/exa-postgres-interface \
+sudo install -m 0755 exa-postgres-interface-v0.0.3-linux-x86_64/bin/exa-postgres-interface \
   /opt/exa-postgres-interface/bin/exa-postgres-interface
 sudo install -m 0640 -o root -g exa-postgres-interface \
-  exa-postgres-interface-v0.0.2-linux-x86_64/config/example.toml \
+  exa-postgres-interface-v0.0.3-linux-x86_64/config/example.toml \
   /etc/exa-postgres-interface/config.toml
 ```
 
@@ -198,7 +198,7 @@ catalog SQL non-interactively. The service uses `--no-bootstrap` so it never
 waits for credentials:
 
 ```bash
-sudo install -m 0644 exa-postgres-interface-v0.0.2-linux-x86_64/packaging/exa-postgres-interface.service \
+sudo install -m 0644 exa-postgres-interface-v0.0.3-linux-x86_64/packaging/exa-postgres-interface.service \
   /etc/systemd/system/exa-postgres-interface.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now exa-postgres-interface
@@ -230,11 +230,11 @@ or support scenario that still needs the legacy database-side rewrite path,
 install the fallback script:
 
 ```bash
-exa-postgres-interface-v0.0.2-linux-x86_64/bin/exasol_exec \
+exa-postgres-interface-v0.0.3-linux-x86_64/bin/exasol_exec \
   --dsn EXASOL_HOST:8563 \
   --user sys \
   --password 'EXASOL_PASSWORD' \
-  --file exa-postgres-interface-v0.0.2-linux-x86_64/sql/exasol_sql_preprocessor.sql
+  --file exa-postgres-interface-v0.0.3-linux-x86_64/sql/exasol_sql_preprocessor.sql
 ```
 
 Then enable it explicitly:
