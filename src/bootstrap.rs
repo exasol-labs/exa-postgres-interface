@@ -180,7 +180,7 @@ fn ensure_optional_preprocessor(
         "Optional PG_CATALOG.PG_SQL_PREPROCESSOR fallback is configured but missing. Install it now?",
         false,
     )? {
-        session.execute(PREPROCESSOR_SQL)?;
+        execute_exasol_script(session, PREPROCESSOR_SQL)?;
         println!("Installed PG_CATALOG.PG_SQL_PREPROCESSOR.");
     }
     Ok(())
@@ -188,9 +188,94 @@ fn ensure_optional_preprocessor(
 
 fn install_catalog(session: &mut ExasolSession) -> Result<(), ExasolError> {
     println!("Installing PostgreSQL compatibility objects...");
-    session.execute(CATALOG_SQL)?;
+    execute_exasol_script(session, CATALOG_SQL)?;
     println!("Installed PG_CATALOG and INFORMATION_SCHEMA compatibility objects.");
     Ok(())
+}
+
+fn execute_exasol_script(session: &mut ExasolSession, sql_text: &str) -> Result<(), ExasolError> {
+    let statements = split_exasol_sql(sql_text);
+    for (idx, statement) in statements.iter().enumerate() {
+        println!(
+            "[{}/{}] {}",
+            idx + 1,
+            statements.len(),
+            preview_statement(statement)
+        );
+        session.execute(statement)?;
+    }
+    Ok(())
+}
+
+fn split_exasol_sql(sql_text: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut buffer = Vec::new();
+    let mut in_compound_statement = false;
+
+    for raw_line in sql_text.lines() {
+        let stripped = raw_line.trim();
+
+        if stripped == "--/" {
+            continue;
+        }
+
+        if buffer.is_empty() && (stripped.is_empty() || stripped.starts_with("--")) {
+            continue;
+        }
+
+        buffer.push(raw_line);
+
+        let upper = stripped.to_ascii_uppercase();
+        if upper.starts_with("CREATE")
+            && (format!(" {upper} ").contains(" FUNCTION ")
+                || format!(" {upper} ").contains(" SCRIPT "))
+        {
+            in_compound_statement = true;
+        }
+
+        if in_compound_statement && stripped == "/" {
+            let statement = buffer[..buffer.len() - 1].join("\n").trim().to_owned();
+            if !statement.is_empty() {
+                statements.push(statement);
+            }
+            buffer.clear();
+            in_compound_statement = false;
+        } else if !in_compound_statement && stripped.ends_with(';') {
+            let statement = buffer
+                .join("\n")
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_owned();
+            if !statement.is_empty() {
+                statements.push(statement);
+            }
+            buffer.clear();
+        }
+    }
+
+    let tail = buffer
+        .join("\n")
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_owned();
+    if !tail.is_empty() {
+        statements.push(tail);
+    }
+
+    statements
+}
+
+fn preview_statement(sql: &str) -> String {
+    let one_line = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= 80 {
+        return one_line;
+    }
+
+    let mut preview = one_line.chars().take(77).collect::<String>();
+    preview.push_str("...");
+    preview
 }
 
 fn first_count(result: ExasolResult) -> Result<usize, ExasolError> {
@@ -271,4 +356,60 @@ fn print_systemd_guidance(config_path: &Path) {
 
 fn toml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CATALOG_SQL, split_exasol_sql};
+
+    #[test]
+    fn splits_semicolon_and_slash_terminated_statements() {
+        let sql = r#"
+CREATE SCHEMA IF NOT EXISTS PG_CATALOG;
+
+--/
+CREATE OR REPLACE FUNCTION PG_CATALOG.TEST_FUNC()
+RETURN DECIMAL(18,0)
+IS
+BEGIN
+    RETURN 1;
+END TEST_FUNC;
+/
+
+CREATE OR REPLACE VIEW PG_CATALOG.TEST_VIEW AS
+SELECT 1 AS VALUE;
+"#;
+
+        let statements = split_exasol_sql(sql);
+
+        assert_eq!(statements.len(), 3);
+        assert_eq!(statements[0], "CREATE SCHEMA IF NOT EXISTS PG_CATALOG");
+        assert!(statements[1].contains("RETURN 1;"));
+        assert!(!statements[1].contains("\n/"));
+        assert_eq!(
+            statements[2],
+            "CREATE OR REPLACE VIEW PG_CATALOG.TEST_VIEW AS\nSELECT 1 AS VALUE"
+        );
+    }
+
+    #[test]
+    fn splits_empty_input_to_no_statements() {
+        assert!(split_exasol_sql("\n\n  \n").is_empty());
+    }
+
+    #[test]
+    fn catalog_sql_is_split_into_individual_statements() {
+        let statements = split_exasol_sql(CATALOG_SQL);
+
+        assert!(statements.len() > 100);
+        assert_eq!(statements[0], "CREATE SCHEMA IF NOT EXISTS PG_CATALOG");
+        assert_eq!(
+            statements[1],
+            "CREATE SCHEMA IF NOT EXISTS INFORMATION_SCHEMA"
+        );
+        assert!(statements.iter().any(|statement| {
+            statement.starts_with("CREATE OR REPLACE FUNCTION PG_CATALOG.OBJ_DESCRIPTION")
+        }));
+        assert!(statements.iter().all(|statement| statement.trim() != "/"));
+    }
 }
