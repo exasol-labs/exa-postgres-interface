@@ -106,21 +106,58 @@ public class PgJdbcCompatibilitySuite {
             }
 
             try (Connection conn = openConnection(config)) {
-                if (probe.prepared) {
-                    try (PreparedStatement stmt = conn.prepareStatement(probe.sql)) {
-                        probe.binder.bind(stmt, sample);
-                        try (ResultSet rs = stmt.executeQuery()) {
-                            reporter.recordPass(probe.persona, probe.id, probe.expectation, describeResultSet(rs));
-                        }
-                    }
-                } else {
-                    try (Statement stmt = conn.createStatement(); ResultSet rs = stmt.executeQuery(probe.sql)) {
-                        reporter.recordPass(probe.persona, probe.id, probe.expectation, describeResultSet(rs));
-                    }
-                }
+                reporter.recordPass(
+                    probe.persona,
+                    probe.id,
+                    probe.expectation,
+                    executeProbe(conn, probe, sample)
+                );
             } catch (Throwable ex) {
                 reporter.recordFailure(probe.persona, probe.id, probe.expectation, ex);
             }
+        }
+    }
+
+    private static String executeProbe(Connection conn, QueryProbe probe, SampleNames sample) throws SQLException {
+        try {
+            runSupportSql(conn, probe.setupSql);
+            if (probe.prepared) {
+                try (PreparedStatement stmt = conn.prepareStatement(probe.sql)) {
+                    probe.binder.bind(stmt, sample);
+                    return describeExecution(stmt.execute(), stmt);
+                }
+            }
+            try (Statement stmt = conn.createStatement()) {
+                return describeExecution(stmt.execute(probe.sql), stmt);
+            }
+        } finally {
+            runCleanupSql(conn, probe.cleanupSql);
+        }
+    }
+
+    private static void runSupportSql(Connection conn, List<String> statements) throws SQLException {
+        if (statements.isEmpty()) {
+            return;
+        }
+        try (Statement stmt = conn.createStatement()) {
+            for (String sql : statements) {
+                stmt.execute(sql);
+            }
+        }
+    }
+
+    private static void runCleanupSql(Connection conn, List<String> statements) {
+        if (statements.isEmpty()) {
+            return;
+        }
+        try (Statement stmt = conn.createStatement()) {
+            for (String sql : statements) {
+                try {
+                    stmt.execute(sql);
+                } catch (SQLException ignored) {
+                }
+            }
+        } catch (SQLException ignored) {
         }
     }
 
@@ -171,6 +208,16 @@ public class PgJdbcCompatibilitySuite {
         }
     }
 
+    private static String describeExecution(boolean hasResultSet, Statement stmt) throws SQLException {
+        if (hasResultSet) {
+            try (ResultSet rs = stmt.getResultSet()) {
+                return "statement=resultset " + describeResultSet(rs);
+            }
+        }
+        return "statement=update update_count=" + stmt.getUpdateCount()
+            + " more_results=" + stmt.getMoreResults(Statement.CLOSE_ALL_RESULTS);
+    }
+
     private static String formatRow(ResultSet rs, ResultSetMetaData meta) throws SQLException {
         StringBuilder sb = new StringBuilder();
         for (int i = 1; i <= meta.getColumnCount(); i++) {
@@ -217,14 +264,27 @@ public class PgJdbcCompatibilitySuite {
         final boolean prepared;
         final String sql;
         final StatementBinder binder;
+        final List<String> setupSql;
+        final List<String> cleanupSql;
 
-        QueryProbe(String persona, String id, Expectation expectation, boolean prepared, String sql, StatementBinder binder) {
+        QueryProbe(
+            String persona,
+            String id,
+            Expectation expectation,
+            boolean prepared,
+            String sql,
+            StatementBinder binder,
+            List<String> setupSql,
+            List<String> cleanupSql
+        ) {
             this.persona = persona;
             this.id = id;
             this.expectation = expectation;
             this.prepared = prepared;
             this.sql = sql;
             this.binder = binder;
+            this.setupSql = setupSql;
+            this.cleanupSql = cleanupSql;
         }
 
         static List<QueryProbe> corpus(SampleNames sample) {
@@ -378,11 +438,112 @@ public class PgJdbcCompatibilitySuite {
             probes.add(simple("analyst", "jsonb-build-object", Expectation.EXPLORATORY,
                 "SELECT jsonb_build_object('customer', customer_name) FROM pg_demo.orders LIMIT 1"));
 
+            probes.add(simple("dml", "insert-select-noop", Expectation.EXPLORATORY,
+                "INSERT INTO pg_demo.orders (order_id, customer_name, amount, order_ts) "
+                    + "SELECT 999999, 'Gateway Probe', 1.23, CURRENT_TIMESTAMP WHERE 1 = 0"));
+            probes.add(simple("dml", "update-noop", Expectation.EXPLORATORY,
+                "UPDATE pg_demo.orders SET amount = amount WHERE 1 = 0"));
+            probes.add(simple("dml", "delete-noop", Expectation.EXPLORATORY,
+                "DELETE FROM pg_demo.orders WHERE 1 = 0"));
+            probes.add(simple("dml", "merge-noop", Expectation.EXPLORATORY,
+                "MERGE INTO pg_demo.orders AS target "
+                    + "USING (SELECT 999999 AS order_id, 'Gateway Probe' AS customer_name, 1.23 AS amount, CURRENT_TIMESTAMP AS order_ts) src "
+                    + "ON target.order_id = src.order_id "
+                    + "WHEN MATCHED AND 1 = 0 THEN UPDATE SET amount = target.amount"));
+
+            probes.add(withSetupAndCleanup("ddl", "create-drop-table", Expectation.EXPLORATORY,
+                "CREATE TABLE " + sample.scratchTable + " (id INTEGER)",
+                cleanup("DROP TABLE " + sample.scratchTable)));
+            probes.add(withSetupAndCleanup("ddl", "create-drop-view", Expectation.EXPLORATORY,
+                "CREATE VIEW " + sample.scratchView + " AS SELECT 1 AS id",
+                cleanup("DROP VIEW " + sample.scratchView)));
+            probes.add(withSetupAndCleanup(
+                "ddl",
+                "alter-table-add-column",
+                Expectation.EXPLORATORY,
+                "ALTER TABLE " + sample.scratchTable + " ADD COLUMN note VARCHAR(20)",
+                setup("CREATE TABLE " + sample.scratchTable + " (id INTEGER)"),
+                cleanup("DROP TABLE " + sample.scratchTable)
+            ));
+            probes.add(withSetupAndCleanup(
+                "ddl",
+                "truncate-table",
+                Expectation.EXPLORATORY,
+                "TRUNCATE TABLE " + sample.scratchTable,
+                setup(
+                    "CREATE TABLE " + sample.scratchTable + " (id INTEGER)",
+                    "INSERT INTO " + sample.scratchTable + " VALUES (1)"
+                ),
+                cleanup("DROP TABLE " + sample.scratchTable)
+            ));
+            probes.add(withSetupAndCleanup(
+                "ddl",
+                "drop-table",
+                Expectation.EXPLORATORY,
+                "DROP TABLE " + sample.scratchTable,
+                setup("CREATE TABLE " + sample.scratchTable + " (id INTEGER)")
+            ));
+
+            probes.add(simple("transaction", "begin", Expectation.EXPLORATORY, "BEGIN"));
+            probes.add(simple("transaction", "commit", Expectation.EXPLORATORY, "COMMIT"));
+            probes.add(simple("transaction", "rollback", Expectation.EXPLORATORY, "ROLLBACK"));
+            probes.add(withSetupAndCleanup(
+                "transaction",
+                "savepoint",
+                Expectation.EXPLORATORY,
+                "SAVEPOINT gateway_probe_sp",
+                setup("BEGIN"),
+                cleanup("ROLLBACK")
+            ));
+            probes.add(withSetupAndCleanup(
+                "transaction",
+                "rollback-to-savepoint",
+                Expectation.EXPLORATORY,
+                "ROLLBACK TO SAVEPOINT gateway_probe_sp",
+                setup("BEGIN", "SAVEPOINT gateway_probe_sp"),
+                cleanup("ROLLBACK")
+            ));
+            probes.add(withSetupAndCleanup(
+                "transaction",
+                "release-savepoint",
+                Expectation.EXPLORATORY,
+                "RELEASE SAVEPOINT gateway_probe_sp",
+                setup("BEGIN", "SAVEPOINT gateway_probe_sp"),
+                cleanup("ROLLBACK")
+            ));
+
+            probes.add(simple("session", "set-application-name", Expectation.EXPLORATORY,
+                "SET application_name = 'pg-jdbc-compat-suite'"));
+            probes.add(simple("session", "show-server-version", Expectation.EXPLORATORY, "SHOW server_version"));
+            probes.add(simple("session", "reset-application-name", Expectation.EXPLORATORY, "RESET application_name"));
+            probes.add(simple("session", "set-search-path", Expectation.EXPLORATORY,
+                "SET search_path TO pg_demo, pg_catalog"));
+
+            probes.add(simple("utility", "explain-select", Expectation.EXPLORATORY,
+                "EXPLAIN SELECT * FROM pg_demo.orders"));
+            probes.add(simple("utility", "explain-analyze-select", Expectation.EXPLORATORY,
+                "EXPLAIN ANALYZE SELECT * FROM pg_demo.orders"));
+            probes.add(simple("utility", "lock-table", Expectation.EXPLORATORY,
+                "LOCK TABLE pg_demo.orders IN ACCESS SHARE MODE"));
+            probes.add(simple("utility", "copy-to-stdout", Expectation.EXPLORATORY,
+                "COPY (SELECT order_id FROM pg_demo.orders ORDER BY order_id) TO STDOUT"));
+            probes.add(simple("utility", "vacuum", Expectation.EXPLORATORY, "VACUUM pg_demo.orders"));
+            probes.add(simple("utility", "analyze", Expectation.EXPLORATORY, "ANALYZE pg_demo.orders"));
+
             return probes;
         }
 
         static QueryProbe simple(String persona, String id, Expectation expectation, String sql) {
-            return new QueryProbe(persona, id, expectation, false, sql, NoOpBinder.INSTANCE);
+            return new QueryProbe(
+                persona,
+                id,
+                expectation,
+                false,
+                sql,
+                NoOpBinder.INSTANCE,
+                Collections.<String>emptyList(),
+                Collections.<String>emptyList()
+            );
         }
 
         static QueryProbe prepared(
@@ -392,7 +553,54 @@ public class PgJdbcCompatibilitySuite {
             String sql,
             StatementBinder binder
         ) {
-            return new QueryProbe(persona, id, expectation, true, sql, binder);
+            return new QueryProbe(
+                persona,
+                id,
+                expectation,
+                true,
+                sql,
+                binder,
+                Collections.<String>emptyList(),
+                Collections.<String>emptyList()
+            );
+        }
+
+        static QueryProbe withSetupAndCleanup(
+            String persona,
+            String id,
+            Expectation expectation,
+            String sql,
+            List<String> cleanupSql
+        ) {
+            return new QueryProbe(
+                persona,
+                id,
+                expectation,
+                false,
+                sql,
+                NoOpBinder.INSTANCE,
+                Collections.<String>emptyList(),
+                cleanupSql
+            );
+        }
+
+        static QueryProbe withSetupAndCleanup(
+            String persona,
+            String id,
+            Expectation expectation,
+            String sql,
+            List<String> setupSql,
+            List<String> cleanupSql
+        ) {
+            return new QueryProbe(persona, id, expectation, false, sql, NoOpBinder.INSTANCE, setupSql, cleanupSql);
+        }
+
+        static List<String> setup(String... statements) {
+            return Arrays.asList(statements);
+        }
+
+        static List<String> cleanup(String... statements) {
+            return Arrays.asList(statements);
         }
     }
 
@@ -539,12 +747,17 @@ public class PgJdbcCompatibilitySuite {
         final String schema;
         final String table;
         final String columnPattern;
+        final String scratchTable;
+        final String scratchView;
 
         SampleNames(String catalog, String schema, String table, String columnPattern) {
             this.catalog = catalog;
             this.schema = schema;
             this.table = table;
             this.columnPattern = columnPattern;
+            String suffix = Long.toString(System.currentTimeMillis());
+            this.scratchTable = schema + ".GATEWAY_COMPAT_" + suffix;
+            this.scratchView = schema + ".GATEWAY_COMPAT_V_" + suffix;
         }
     }
 
@@ -589,7 +802,7 @@ public class PgJdbcCompatibilitySuite {
                 throw new IllegalArgumentException(
                     "usage: PgJdbcCompatibilitySuite <jdbc-url> <user> <password> [--catalog=exasol] "
                         + "[--schema=PG_DEMO] [--table=ORDERS] [--column-pattern=%] "
-                        + "[--personas=baseline,dbvisualizer,pgjdbc,metabase,dbeaver,analyst] "
+                        + "[--personas=baseline,dbvisualizer,pgjdbc,metabase,dbeaver,analyst,dml,ddl,transaction,session,utility] "
                         + "[--strict] [--output=/path/report.txt]"
                 );
             }

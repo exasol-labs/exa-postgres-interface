@@ -23,9 +23,12 @@ schema = ""
 
 [translation]
 enabled = true
-sql_preprocessor_script = "PG_DEMO.PG_SQL_PREPROCESSOR"
-session_init_sql = [
-  # Keep deployment-specific script names here rather than in source code.
-  # The server expands {script} with sql_preprocessor_script.
-  "ALTER SESSION SET SQL_PREPROCESSOR_SCRIPT = {script}"
-]
+# PostgreSQL-to-Exasol dialect translation runs inside the gateway by default.
+# The Exasol SQL preprocessor is not required for normal operation.
+#
+# Optional migration fallback for deployments that still need the legacy
+# database-side preprocessor:
+# sql_preprocessor_script = "PG_CATALOG.PG_SQL_PREPROCESSOR"
+# session_init_sql = [
+#   "ALTER SESSION SET SQL_PREPROCESSOR_SCRIPT = {script}"
+# ]

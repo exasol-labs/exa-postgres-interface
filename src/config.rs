@@ -133,8 +133,6 @@ mod tests {
 
             [translation]
             enabled = true
-            sql_preprocessor_script = "PG_DEMO.PG_SQL_PREPROCESSOR"
-            session_init_sql = ["ALTER SESSION SET SQL_PREPROCESSOR_SCRIPT = {script}"]
         "#;
 
         let config: AppConfig = toml::from_str(raw).unwrap();
@@ -146,6 +144,29 @@ mod tests {
         );
         assert_eq!(config.exasol.dsn, "127.0.0.1:8563");
         assert!(!config.exasol.validate_certificate);
+        assert!(config.translation.enabled);
+        assert!(config.translation.sql_preprocessor_script.is_empty());
+        assert!(config.translation.session_init_sql.is_empty());
+    }
+
+    #[test]
+    fn loads_optional_preprocessor_fallback_config() {
+        let raw = r#"
+            [exasol]
+            dsn = "127.0.0.1:8563"
+
+            [translation]
+            enabled = true
+            sql_preprocessor_script = "PG_CATALOG.PG_SQL_PREPROCESSOR"
+            session_init_sql = ["ALTER SESSION SET SQL_PREPROCESSOR_SCRIPT = {script}"]
+        "#;
+
+        let config: AppConfig = toml::from_str(raw).unwrap();
+
+        assert_eq!(
+            config.translation.sql_preprocessor_script,
+            "PG_CATALOG.PG_SQL_PREPROCESSOR"
+        );
         assert_eq!(config.translation.session_init_sql.len(), 1);
     }
 }

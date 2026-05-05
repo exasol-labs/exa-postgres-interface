@@ -8,7 +8,7 @@ PREPROCESSOR = ROOT / "sql" / "exasol_sql_preprocessor.sql"
 
 def load_preprocessor_namespace():
     text = PREPROCESSOR.read_text(encoding="utf-8")
-    marker = "CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT pg_demo.pg_sql_preprocessor AS\n"
+    marker = "CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT PG_CATALOG.PG_SQL_PREPROCESSOR AS\n"
     start = text.index(marker) + len(marker)
     end = text.rindex("\n/")
     namespace = {}
@@ -146,30 +146,70 @@ ORDER BY "table-schema", "table-name", "database-position"
 def test_rewrites_metabase_describe_fks_query_family():
     namespace = load_preprocessor_namespace()
     sql = """
-SELECT fk_ns.nspname AS "fk-table-schema",
-       fk_table.relname AS "fk-table-name",
-       fk_column.attname AS "fk-column-name",
-       pk_ns.nspname AS "pk-table-schema",
-       pk_table.relname AS "pk-table-name",
-       pk_column.attname AS "pk-column-name"
-FROM pg_constraint AS c
-JOIN pg_class AS fk_table ON c.conrelid = fk_table.oid
-JOIN pg_namespace AS fk_ns ON c.connamespace = fk_ns.oid
-JOIN pg_attribute AS fk_column ON c.conrelid = fk_column.attrelid
-JOIN pg_class AS pk_table ON c.confrelid = pk_table.oid
-JOIN pg_namespace AS pk_ns ON pk_table.relnamespace = pk_ns.oid
-JOIN pg_attribute AS pk_column ON c.confrelid = pk_column.attrelid
+SELECT "fk_ns"."nspname" AS "fk-table-schema",
+       "fk_table"."relname" AS "fk-table-name",
+       "fk_column"."attname" AS "fk-column-name",
+       "pk_ns"."nspname" AS "pk-table-schema",
+       "pk_table"."relname" AS "pk-table-name",
+       "pk_column"."attname" AS "pk-column-name"
+FROM "pg_constraint" AS "c"
+JOIN "pg_class" AS "fk_table" ON "c"."conrelid" = "fk_table"."oid"
+JOIN "pg_namespace" AS "fk_ns" ON "c"."connamespace" = "fk_ns"."oid"
+JOIN "pg_attribute" AS "fk_column" ON "c"."conrelid" = "fk_column"."attrelid"
+JOIN "pg_class" AS "pk_table" ON "c"."confrelid" = "pk_table"."oid"
+JOIN "pg_namespace" AS "pk_ns" ON "pk_table"."relnamespace" = "pk_ns"."oid"
+JOIN "pg_attribute" AS "pk_column" ON "c"."confrelid" = "pk_column"."attrelid"
 WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
-  AND c.contype = 'f'::char
-  AND fk_column.attnum = ANY(c.conkey)
-  AND pk_column.attnum = ANY(c.confkey)
-  AND fk_ns.nspname IN ('NYC_UBER')
+  AND "c"."contype" = 'f'::char
+  AND "fk_column"."attnum" = ANY(c.conkey)
+  AND "pk_column"."attnum" = ANY(c.confkey)
+  AND "fk_ns"."nspname" IN ('NYC_UBER')
 ORDER BY "fk-table-schema", "fk-table-name"
 """
     translated = namespace["adapter_call"](sql)
     assert "SYS.EXA_DBA_CONSTRAINT_COLUMNS" in translated
     assert "ANY(" not in translated
     assert "CC.CONSTRAINT_SCHEMA IN ('NYC_UBER')" in translated
+
+
+def test_rewrites_metabase_primary_keys_query_family():
+    namespace = load_preprocessor_namespace()
+    sql = """
+SELECT result.TABLE_CAT AS "TABLE_CAT",
+       result.TABLE_SCHEM AS "TABLE_SCHEM",
+       result.TABLE_NAME AS "TABLE_NAME",
+       result.COLUMN_NAME AS "COLUMN_NAME",
+       result.KEY_SEQ AS "KEY_SEQ",
+       result.PK_NAME AS "PK_NAME"
+FROM (
+  SELECT current_database() AS TABLE_CAT,
+         n.nspname AS TABLE_SCHEM,
+         ct.relname AS TABLE_NAME,
+         a.attname AS COLUMN_NAME,
+         (information_schema._pg_expandarray(i.indkey)).n AS KEY_SEQ,
+         ci.relname AS PK_NAME,
+         information_schema._pg_expandarray(i.indkey) AS KEYS,
+         a.attnum AS A_ATTNUM,
+         i.indnkeyatts as KEY_COUNT
+  FROM pg_catalog.pg_class ct
+  JOIN pg_catalog.pg_attribute a ON (ct.oid = a.attrelid)
+  JOIN pg_catalog.pg_namespace n ON (ct.relnamespace = n.oid)
+  JOIN pg_catalog.pg_index i ON (a.attrelid = i.indrelid)
+  JOIN pg_catalog.pg_class ci ON (ci.oid = i.indexrelid)
+  WHERE true
+    AND n.nspname = 'DEMO_SHARED'
+    AND ct.relname = 'DAILY_ORDER_KPI'
+    AND i.indisprimary
+) result
+WHERE result.A_ATTNUM = (result.KEYS).x
+  AND result.KEY_SEQ <= KEY_COUNT
+ORDER BY result.table_name, result.pk_name, result.key_seq
+"""
+    translated = namespace["adapter_call"](sql)
+    assert "SYS.EXA_DBA_CONSTRAINT_COLUMNS" in translated
+    assert "_PG_EXPANDARRAY" not in translated.upper()
+    assert "CC.CONSTRAINT_SCHEMA = 'DEMO_SHARED'" in translated
+    assert "CC.CONSTRAINT_TABLE = 'DAILY_ORDER_KPI'" in translated
 
 
 def test_rewrites_metabase_describe_indexes_query_family():
@@ -196,10 +236,101 @@ WHERE tmp.pos = 1
     assert "_PG_EXPANDARRAY" not in translated.upper()
 
 
+def test_rewrites_qlik_table_list_varchar_casts():
+    namespace = load_preprocessor_namespace()
+    sql = """
+SELECT * FROM (
+  select CAST(current_database() AS VARCHAR(127)) AS "TABLE_CAT",
+         CAST(nspname AS VARCHAR(127)) AS "TABLE_SCHEM",
+         CAST(relname AS VARCHAR(127)) AS "TABLE_NAME",
+         CAST(
+           CASE
+             WHEN nspname ~'^pg_temp' THEN 'LOCAL TEMPORARY'
+             WHEN relkind = 'r' THEN CASE
+               WHEN nspname IN ('pg_catalog', 'information_schema', 'pg_toast') THEN 'SYSTEM TABLE'
+               ELSE 'TABLE'
+             END
+             WHEN relkind = 'v' THEN 'VIEW'
+             WHEN relkind = 'm' THEN 'MATVIEW'
+           END AS VARCHAR(127)
+         ) AS "TABLE_TYPE",
+         CAST('' AS VARCHAR(250)) AS "REMARKS"
+  FROM pg_catalog.pg_class c, pg_catalog.pg_namespace n
+  WHERE relkind IN('r', 'v', 'm') AND n.oid = relnamespace
+) S
+WHERE "TABLE_SCHEM" like 'DEMO_SALES'::varchar
+  AND "TABLE_TYPE" IN ('TABLE'::varchar, 'SYSTEM TABLE'::varchar)
+ORDER BY "TABLE_TYPE", "TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME"
+"""
+    translated = namespace["adapter_call"](sql)
+    assert "AS VARCHAR)" not in translated.upper()
+    assert "CAST('DEMO_SALES' AS VARCHAR(2000000))" in translated
+    assert "CAST('TABLE' AS VARCHAR(2000000))" in translated
+    assert "CAST('SYSTEM TABLE' AS VARCHAR(2000000))" in translated
+
+
+def test_rewrites_qlik_column_list_type_name_star_projection():
+    namespace = load_preprocessor_namespace()
+    sql = """
+SELECT
+  table_catalog AS TABLE_CAT,
+  table_schema AS TABLE_SCHEM,
+  table_name AS TABLE_NAME,
+  column_name AS COLUMN_NAME,
+  type_name AS TYPE_NAME,
+  ordinal_position AS ORDINAL_POSITION
+FROM (
+  SELECT
+    CASE udt_name
+      WHEN 'boolean' THEN 'bool'
+      WHEN 'integer' THEN 'int4'
+      WHEN 'character varying' THEN 'varchar'
+      ELSE udt_name
+    END AS type_name,
+    *
+  FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE table_schema LIKE 'DEMO_FINANCE'::varchar
+    AND table_name LIKE 'OPEN_AR_V'::varchar
+) S
+ORDER BY table_catalog, table_schema, table_name, ordinal_position
+"""
+    translated = namespace["adapter_call"](sql)
+    assert "TYPE_NAME, * FROM INFORMATION_SCHEMA.COLUMNS" not in translated.upper()
+    assert 'TYPE_NAME, "TABLE_CATALOG", "TABLE_SCHEMA"' in translated.upper()
+    assert "CAST('DEMO_FINANCE' AS VARCHAR(2000000))" in translated
+    assert "CAST('OPEN_AR_V' AS VARCHAR(2000000))" in translated
+
+
+def test_rewrites_dbvis_tablespace_size_functions():
+    namespace = load_preprocessor_namespace()
+    sql = """
+SELECT
+    ts.spcname "Tablespace",
+    ro.rolname "Owner",
+    pg_size_pretty(pg_tablespace_size(spcname)) "Size",
+    pg_tablespace_location(ts.oid) "Location",
+    ts.spcoptions "Options"
+FROM
+    pg_catalog.pg_tablespace ts,
+    pg_catalog.pg_roles ro
+WHERE
+    ts.spcowner = ro.oid
+"""
+    translated = namespace["adapter_call"](sql)
+    assert "PG_CATALOG.PG_SIZE_PRETTY" in translated
+    assert "PG_CATALOG.PG_TABLESPACE_SIZE" in translated
+    assert "PG_CATALOG.PG_TABLESPACE_LOCATION" in translated
+    assert "PG_SIZE_PRETTY(" not in translated.replace("PG_CATALOG.PG_SIZE_PRETTY(", "")
+
+
 if __name__ == "__main__":
     test_rewrites_postgres_qualified_operator_syntax()
     test_rewrites_metabase_table_privileges_query()
     test_rewrites_metabase_describe_syncable_tables_query()
     test_rewrites_metabase_describe_fields_query_family()
     test_rewrites_metabase_describe_fks_query_family()
+    test_rewrites_metabase_primary_keys_query_family()
     test_rewrites_metabase_describe_indexes_query_family()
+    test_rewrites_qlik_table_list_varchar_casts()
+    test_rewrites_qlik_column_list_type_name_star_projection()
+    test_rewrites_dbvis_tablespace_size_functions()

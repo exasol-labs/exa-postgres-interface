@@ -5,6 +5,11 @@ scope. Simple Query and Extended Query paths work for row-returning statements,
 common session commands, transaction wrappers, JDBC metadata probes, and the
 catalog browser paths exercised so far.
 
+Future target scope note: this read-only feature spec describes the implemented
+prototype baseline. The next design direction is defined in
+`specs/_plans/change-postgres-read-write-compatibility/` and replaces the
+read-only policy with a capability-based read/write compatibility model.
+
 The protocol server SHALL provide the smallest PostgreSQL-compatible connection and query path needed for DbVisualizer to reach Exasol. The server SHALL preserve Exasol as the executing database and SHALL make unsupported PostgreSQL behavior explicit.
 
 The first supported statement scope is read-only DQL, but the protocol server SHOULD be designed as a session-oriented gateway that can add write-capable PostgreSQL behavior later without replacing the connection, authentication, session, or response-mapping architecture.

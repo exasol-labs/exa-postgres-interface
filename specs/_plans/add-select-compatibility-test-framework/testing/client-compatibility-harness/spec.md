@@ -5,15 +5,15 @@ sweeps, persona query corpora, and a gateway-vs-direct Exasol benchmark. It is
 the preferred regression path after metadata compatibility or SQL preprocessor
 changes.
 
-The repository SHALL provide a repeatable compatibility harness for the read-only PostgreSQL gateway. The harness SHALL report which JDBC metadata calls and PostgreSQL-flavored `SELECT` queries succeed, fail, or degrade for realistic client personas without assuming full PostgreSQL compatibility. The repository SHALL also provide a repeatable latency benchmark that compares gateway query execution against direct Exasol JDBC for logically equivalent read-only queries.
+The repository SHALL provide a repeatable compatibility harness for the PostgreSQL gateway. The harness SHALL report which JDBC metadata calls and PostgreSQL-flavored statement families succeed, fail, or degrade for realistic client personas without assuming full PostgreSQL compatibility. The repository SHALL also provide a repeatable latency benchmark that compares gateway query execution against direct Exasol JDBC for logically equivalent read-heavy queries.
 
 ## Background
 
-* The gateway is a read-only PostgreSQL compatibility layer in front of Exasol.
+* The gateway began as a read-mostly PostgreSQL compatibility layer in front of Exasol.
 * The first implementation already has narrow smoke coverage for pgJDBC and DbVisualizer.
 * Real PostgreSQL clients rely on both JDBC metadata APIs and direct `pg_catalog` or `information_schema` queries.
-* The team wants to know which PostgreSQL queries do not work yet, not only which smoke queries already pass.
-* The team also wants to understand gateway overhead for small and medium read-only queries compared with direct Exasol JDBC.
+* The team wants to know which PostgreSQL statement families do not work yet, not only which smoke queries already pass.
+* The team also wants to understand gateway overhead for representative read-heavy queries compared with direct Exasol JDBC.
 
 ## Scenarios
 
@@ -44,6 +44,16 @@ The repository SHALL provide a repeatable compatibility harness for the read-onl
 * *THEN* the suite SHALL include query families informed by pgJDBC, DbVisualizer, Metabase, and DBeaver behavior
 * *AND* the documentation SHALL identify which upstream tools informed each persona
 * *AND* the suite MAY add analyst-oriented PostgreSQL `SELECT` stress cases beyond the observed client corpora
+* *AND* the suite SHOULD also include representative DML, DDL, transaction, session, and utility operations so unsupported non-read behavior is visible in the same report
+
+<!-- DELTA:NEW -->
+### Scenario: SQL probes cover mixed statement kinds
+
+* *GIVEN* PostgreSQL clients issue more than just `SELECT` statements
+* *WHEN* the compatibility suite runs its SQL corpus
+* *THEN* the suite SHALL support probes that return result sets and probes that return update counts or no rows
+* *AND* the suite SHALL support DQL, DML, DDL, transaction-control, session, and utility statements in the same framework
+* *AND* the suite SHOULD allow per-probe setup and cleanup SQL when a statement family requires scratch objects or transaction context
 
 <!-- DELTA:NEW -->
 ### Scenario: Individual probe failures do not stop discovery
@@ -52,7 +62,7 @@ The repository SHALL provide a repeatable compatibility harness for the read-onl
 * *WHEN* later probes remain runnable
 * *THEN* the suite SHALL continue collecting outcomes for the remaining probes
 * *AND* the final report SHALL separate must-pass failures from exploratory failures
-* *AND* the report SHOULD help the team identify unsupported PostgreSQL query families instead of hiding them behind the first exception
+* *AND* the report SHOULD help the team identify unsupported PostgreSQL statement families instead of hiding them behind the first exception
 
 <!-- DELTA:NEW -->
 ### Scenario: Operators can run the suite with a single command
@@ -67,7 +77,7 @@ The repository SHALL provide a repeatable compatibility harness for the read-onl
 
 * *GIVEN* the operator has both a PostgreSQL gateway JDBC URL and a direct Exasol JDBC URL that reach the same sample data
 * *WHEN* they run the documented benchmark command
-* *THEN* the repository SHALL execute logically equivalent small and medium read-only query pairs against both targets
+* *THEN* the repository SHALL execute logically equivalent read-heavy query pairs against both targets
 * *AND* the benchmark SHALL measure execution latency over repeated warm-connection runs
 * *AND* the report SHALL include summary statistics for both targets plus a gateway-over-direct overhead ratio
 

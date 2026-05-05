@@ -5,6 +5,12 @@ systemd unit template. Current deployment guidance installs the binary under
 `/opt/exa-postgres-interface/bin` and config under
 `/etc/exa-postgres-interface/config.toml`.
 
+Future target scope note: this feature spec describes the implemented runtime
+baseline. The follow-up read/write compatibility plan now targets a simpler
+administration model where PostgreSQL-to-Exasol dialect translation moves into
+the gateway and Exasol-side SQL preprocessing becomes optional fallback rather
+than mandatory setup.
+
 The prototype SHOULD be installable as a long-running server process on Linux. The preferred operating model is a binary managed by systemd with external configuration and observable logs.
 
 ## Background
@@ -31,7 +37,7 @@ The prototype SHOULD be installable as a long-running server process on Linux. T
 * *WHEN* the server starts
 * *THEN* the configuration SHALL include the Exasol endpoint needed to create client sessions
 * *AND* the configuration SHOULD allow client-supplied credentials to be passed through to Exasol
-* *AND* the configuration SHALL identify how the Python SQL preprocessor is installed, selected, or initialized
+* *AND* the configuration SHALL identify any required SQL translation mechanism, including whether translation is gateway-owned or uses an explicitly enabled Exasol-side preprocessor fallback
 
 <!-- DELTA:NEW -->
 ### Scenario: Operator runs the protocol server through systemd

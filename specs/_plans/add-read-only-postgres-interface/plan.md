@@ -6,6 +6,12 @@ binary, SQL translation runs inside Exasol through
 provided by Exasol-side `PG_CATALOG` and `INFORMATION_SCHEMA` schemas. The
 systemd deployment path is documented in `README.md`.
 
+Future target scope note: the read-only policy in this implemented prototype
+plan is superseded by `specs/_plans/change-postgres-read-write-compatibility/`,
+which defines the next design direction as capability-based read/write
+PostgreSQL compatibility where Exasol has an equivalent or the gateway can
+provide explicit compatibility behavior.
+
 ## Objective
 
 Build the first useful prototype path for connecting PostgreSQL-compatible client tools to Exasol through this server.
