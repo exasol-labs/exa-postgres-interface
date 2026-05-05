@@ -3,14 +3,20 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n1)}"
-TARGET_TRIPLE="${TARGET_TRIPLE:-$(uname -m)-unknown-linux-gnu}"
+TARGET_TRIPLE="${TARGET_TRIPLE:-x86_64-unknown-linux-musl}"
 
 case "$TARGET_TRIPLE" in
-  x86_64-unknown-linux-gnu)
+  x86_64-unknown-linux-musl)
     BINARY_NAME="exa-postgres-interface-v${VERSION}-linux-x86_64"
     ;;
-  aarch64-unknown-linux-gnu)
+  x86_64-unknown-linux-gnu)
+    BINARY_NAME="exa-postgres-interface-v${VERSION}-linux-x86_64-gnu"
+    ;;
+  aarch64-unknown-linux-musl)
     BINARY_NAME="exa-postgres-interface-v${VERSION}-linux-aarch64"
+    ;;
+  aarch64-unknown-linux-gnu)
+    BINARY_NAME="exa-postgres-interface-v${VERSION}-linux-aarch64-gnu"
     ;;
   *)
     BINARY_NAME="exa-postgres-interface-v${VERSION}-${TARGET_TRIPLE}"
@@ -20,13 +26,13 @@ esac
 DIST_DIR="$ROOT/dist"
 STAGE_DIR="$DIST_DIR/$BINARY_NAME"
 
-cargo build --release --bins
+cargo build --release --bins --target "$TARGET_TRIPLE"
 
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/config" "$STAGE_DIR/packaging" "$STAGE_DIR/sql" "$STAGE_DIR/docs"
 
-install -m 0755 "$ROOT/target/release/exa-postgres-interface" "$STAGE_DIR/bin/exa-postgres-interface"
-install -m 0755 "$ROOT/target/release/exasol_exec" "$STAGE_DIR/bin/exasol_exec"
+install -m 0755 "$ROOT/target/$TARGET_TRIPLE/release/exa-postgres-interface" "$STAGE_DIR/bin/exa-postgres-interface"
+install -m 0755 "$ROOT/target/$TARGET_TRIPLE/release/exasol_exec" "$STAGE_DIR/bin/exasol_exec"
 install -m 0644 "$ROOT/config/example.toml" "$STAGE_DIR/config/example.toml"
 install -m 0644 "$ROOT/packaging/exa-postgres-interface.service" "$STAGE_DIR/packaging/exa-postgres-interface.service"
 install -m 0644 "$ROOT/sql/postgres_catalog_compatibility.sql" "$STAGE_DIR/sql/postgres_catalog_compatibility.sql"
