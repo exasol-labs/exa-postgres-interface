@@ -23,8 +23,17 @@ use tracing::info;
 use crate::config::AppConfig;
 use crate::pg_server::{ExasolPgWireFactory, ExasolPgWireHandler};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+const TOKIO_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(TOKIO_WORKER_STACK_SIZE)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = parse_args()?;
     let config_path = ensure_config_file(args.config_path.clone())?;
 

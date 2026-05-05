@@ -249,6 +249,10 @@ const INFORMATION_SCHEMA_COLUMNS: &[&str] = &[
 ];
 
 pub fn translate_postgres_to_exasol(sql: &str) -> Result<String, TranslationError> {
+    if is_exasol_passthrough_sql(sql) {
+        return Ok(sql.to_owned());
+    }
+
     let normalized = normalize_ansi_quoted_postgres_identifiers(sql);
     let known_metadata_query = rewrite_known_metadata_query(&normalized);
     if known_metadata_query != normalized {
@@ -261,6 +265,136 @@ pub fn translate_postgres_to_exasol(sql: &str) -> Result<String, TranslationErro
         .join("; ");
     let translated = rewrite_sqlglot_edge_cases(&translated);
     Ok(rewrite_ilike(&translated))
+}
+
+fn is_exasol_passthrough_sql(sql: &str) -> bool {
+    let detection_sql = strip_sql_comments_for_detection(sql);
+    let normalized = normalize_for_match(&detection_sql);
+    if normalized.starts_with("with ") {
+        return false;
+    }
+
+    let padded = format!(" {normalized} ");
+    let postgres_specific_tokens = [
+        "::",
+        " ilike ",
+        " operator(",
+        " current_database(",
+        " current_catalog",
+        " current_schemas(",
+        " obj_description(",
+        " shobj_description(",
+        " col_description(",
+        " format_type(",
+        " oidvectortypes(",
+        " to_regclass(",
+        " unnest(",
+        " generate_series(",
+        " returning ",
+        " any(",
+        " array[",
+        " regexp_matches(",
+        " regexp_replace(",
+    ];
+
+    if postgres_specific_tokens
+        .iter()
+        .any(|token| padded.contains(token))
+    {
+        return false;
+    }
+
+    if padded.contains("pg_catalog.")
+        || padded.contains("information_schema.")
+        || CATALOG_RELATIONS
+            .iter()
+            .any(|rel| contains_word(&padded, rel))
+    {
+        return false;
+    }
+
+    if REGEX_MATCH_RE.is_match(sql) || REGEX_NOT_MATCH_RE.is_match(sql) {
+        return false;
+    }
+
+    true
+}
+
+fn strip_sql_comments_for_detection(sql: &str) -> String {
+    let mut output = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while let Some(ch) = chars.next() {
+        if in_single_quote {
+            output.push(ch);
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    output.push(chars.next().unwrap());
+                } else {
+                    in_single_quote = false;
+                }
+            }
+            continue;
+        }
+
+        if in_double_quote {
+            output.push(ch);
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    output.push(chars.next().unwrap());
+                } else {
+                    in_double_quote = false;
+                }
+            }
+            continue;
+        }
+
+        if ch == '\'' {
+            in_single_quote = true;
+            output.push(ch);
+            continue;
+        }
+
+        if ch == '"' {
+            in_double_quote = true;
+            output.push(ch);
+            continue;
+        }
+
+        if ch == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            output.push(' ');
+            for comment_ch in chars.by_ref() {
+                if comment_ch == '\n' {
+                    output.push('\n');
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            output.push(' ');
+            let mut previous = '\0';
+            for comment_ch in chars.by_ref() {
+                if comment_ch == '\n' {
+                    output.push('\n');
+                }
+                if previous == '*' && comment_ch == '/' {
+                    break;
+                }
+                previous = comment_ch;
+            }
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    output
 }
 
 fn normalize_ansi_quoted_postgres_identifiers(sql: &str) -> String {
@@ -841,6 +975,24 @@ fn is_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    let Some(mut start) = haystack.find(needle) else {
+        return false;
+    };
+
+    while let Some(match_start) = haystack[start..].find(needle).map(|idx| start + idx) {
+        let match_end = match_start + needle.len();
+        let before = haystack[..match_start].chars().next_back();
+        let after = haystack[match_end..].chars().next();
+        if !before.is_some_and(is_ident_char) && !after.is_some_and(is_ident_char) {
+            return true;
+        }
+        start = match_end;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,6 +1005,37 @@ mod tests {
         assert!(!translated.to_ascii_uppercase().contains("OPERATOR("));
         assert!(normalized.contains("A.ATTRELID = C.OID"));
         assert!(normalized.contains("A.ATTNUM > 0"));
+    }
+
+    #[test]
+    fn leaves_metabase_mbql_group_by_query_as_exasol_sql() {
+        let sql = r#"-- Metabase:: userID: 1 queryType: MBQL queryHash: af2fd35a339c158f6a0f1f9e64b8760fdc04c809ac6172534676446a6d808b8d
+SELECT "CORE_DB_2026_1_DEMOS"."SHIPMENTS"."CARRIER" AS "CARRIER", COUNT(*) AS "count" FROM "CORE_DB_2026_1_DEMOS"."SHIPMENTS" GROUP BY "CORE_DB_2026_1_DEMOS"."SHIPMENTS"."CARRIER" ORDER BY "CORE_DB_2026_1_DEMOS"."SHIPMENTS"."CARRIER" ASC"#;
+
+        let translated = translate_postgres_to_exasol(sql).unwrap();
+
+        assert_eq!(translated, sql);
+    }
+
+    #[test]
+    fn leaves_large_exasol_compatible_query_as_exasol_sql() {
+        let mut values = Vec::new();
+        for idx in 0..4_000 {
+            values.push(format!("'shipment-{idx:04}'"));
+        }
+        let sql = format!(
+            "SELECT \"CORE_DB_2026_1_DEMOS\".\"SHIPMENTS\".\"CARRIER\" AS \"CARRIER\", \
+             COUNT(*) AS \"count\" FROM \"CORE_DB_2026_1_DEMOS\".\"SHIPMENTS\" \
+             WHERE \"CORE_DB_2026_1_DEMOS\".\"SHIPMENTS\".\"TRACKING_ID\" IN ({}) \
+             GROUP BY \"CORE_DB_2026_1_DEMOS\".\"SHIPMENTS\".\"CARRIER\" \
+             ORDER BY \"CORE_DB_2026_1_DEMOS\".\"SHIPMENTS\".\"CARRIER\" ASC",
+            values.join(", ")
+        );
+
+        assert!(sql.len() > 50_000);
+        let translated = translate_postgres_to_exasol(&sql).unwrap();
+
+        assert_eq!(translated, sql);
     }
 
     #[test]
