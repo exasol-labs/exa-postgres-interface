@@ -119,6 +119,17 @@ public class PgJdbcCompatibilitySuite {
     }
 
     private static String executeProbe(Connection conn, QueryProbe probe, SampleNames sample) throws SQLException {
+        if (probe.expectFailure) {
+            try {
+                runSupportSql(conn, probe.setupSql);
+                try (Statement stmt = conn.createStatement()) {
+                    stmt.execute(probe.sql);
+                }
+                throw new RuntimeException("Expected SQL error but query succeeded for probe: " + probe.id);
+            } catch (SQLException expected) {
+                return "rejected_as_expected: " + expected.getMessage();
+            }
+        }
         try {
             runSupportSql(conn, probe.setupSql);
             if (probe.prepared) {
@@ -266,6 +277,7 @@ public class PgJdbcCompatibilitySuite {
         final StatementBinder binder;
         final List<String> setupSql;
         final List<String> cleanupSql;
+        final boolean expectFailure;
 
         QueryProbe(
             String persona,
@@ -275,7 +287,8 @@ public class PgJdbcCompatibilitySuite {
             String sql,
             StatementBinder binder,
             List<String> setupSql,
-            List<String> cleanupSql
+            List<String> cleanupSql,
+            boolean expectFailure
         ) {
             this.persona = persona;
             this.id = id;
@@ -285,6 +298,7 @@ public class PgJdbcCompatibilitySuite {
             this.binder = binder;
             this.setupSql = setupSql;
             this.cleanupSql = cleanupSql;
+            this.expectFailure = expectFailure;
         }
 
         static List<QueryProbe> corpus(SampleNames sample) {
@@ -516,8 +530,38 @@ public class PgJdbcCompatibilitySuite {
                 "SET application_name = 'pg-jdbc-compat-suite'"));
             probes.add(simple("session", "show-server-version", Expectation.EXPLORATORY, "SHOW server_version"));
             probes.add(simple("session", "reset-application-name", Expectation.EXPLORATORY, "RESET application_name"));
-            probes.add(simple("session", "set-search-path", Expectation.EXPLORATORY,
-                "SET search_path TO pg_demo, pg_catalog"));
+
+            // set-search-path-single: SET single schema and verify current_schema() reflects it
+            probes.add(withSetupAndCleanup(
+                "session", "set-search-path-single", Expectation.MUST_PASS,
+                "SELECT current_schema()",
+                setup("SET search_path = \"PG_DEMO\""),
+                Collections.<String>emptyList()
+            ));
+
+            // set-search-path-multi: multi-schema SET must be rejected with SQL error
+            probes.add(expectingFailure(
+                "session", "set-search-path-multi",
+                "SET search_path TO pg_demo, pg_catalog"
+            ));
+
+            // reset-search-path: RESET search_path is a no-op (success)
+            probes.add(simple("session", "reset-search-path", Expectation.MUST_PASS,
+                "RESET search_path"));
+
+            // show-search-path: SHOW search_path after SET returns the opened schema
+            probes.add(withSetupAndCleanup(
+                "session", "show-search-path", Expectation.MUST_PASS,
+                "SHOW search_path",
+                setup("SET search_path = \"PG_DEMO\""),
+                Collections.<String>emptyList()
+            ));
+
+            // set-search-path-missing-schema: OPEN SCHEMA on nonexistent schema returns SQL error
+            probes.add(expectingFailure(
+                "session", "set-search-path-missing-schema",
+                "SET search_path = \"DOES_NOT_EXIST\""
+            ));
 
             probes.add(simple("utility", "explain-select", Expectation.EXPLORATORY,
                 "EXPLAIN SELECT * FROM pg_demo.orders"));
@@ -542,7 +586,8 @@ public class PgJdbcCompatibilitySuite {
                 sql,
                 NoOpBinder.INSTANCE,
                 Collections.<String>emptyList(),
-                Collections.<String>emptyList()
+                Collections.<String>emptyList(),
+                false
             );
         }
 
@@ -561,7 +606,8 @@ public class PgJdbcCompatibilitySuite {
                 sql,
                 binder,
                 Collections.<String>emptyList(),
-                Collections.<String>emptyList()
+                Collections.<String>emptyList(),
+                false
             );
         }
 
@@ -580,7 +626,8 @@ public class PgJdbcCompatibilitySuite {
                 sql,
                 NoOpBinder.INSTANCE,
                 Collections.<String>emptyList(),
-                cleanupSql
+                cleanupSql,
+                false
             );
         }
 
@@ -592,7 +639,12 @@ public class PgJdbcCompatibilitySuite {
             List<String> setupSql,
             List<String> cleanupSql
         ) {
-            return new QueryProbe(persona, id, expectation, false, sql, NoOpBinder.INSTANCE, setupSql, cleanupSql);
+            return new QueryProbe(persona, id, expectation, false, sql, NoOpBinder.INSTANCE, setupSql, cleanupSql, false);
+        }
+
+        static QueryProbe expectingFailure(String persona, String id, String sql) {
+            return new QueryProbe(persona, id, Expectation.MUST_PASS, false, sql,
+                NoOpBinder.INSTANCE, Collections.<String>emptyList(), Collections.<String>emptyList(), true);
         }
 
         static List<String> setup(String... statements) {

@@ -44,6 +44,7 @@ struct SessionState {
     exasol: Mutex<ExasolSession>,
     extended_results: Mutex<HashMap<String, GatewayResponse>>,
     cursors: Mutex<HashMap<String, GatewayCursor>>,
+    current_schema: Mutex<Option<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +137,7 @@ impl ExasolPgWireHandler {
                 exasol: Mutex::new(session),
                 extended_results: Mutex::new(HashMap::new()),
                 cursors: Mutex::new(HashMap::new()),
+                current_schema: Mutex::new(None),
             })
         })
         .await
@@ -175,6 +177,54 @@ impl ExasolPgWireHandler {
                 command: "SET".to_owned(),
                 rows: None,
             }]),
+            StatementPlan::SetSearchPath { schema } => {
+                let state = client
+                    .session_extensions()
+                    .get::<SessionState>()
+                    .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
+                let escaped = schema.replace('"', "\"\"");
+                let open_sql = format!("OPEN SCHEMA \"{escaped}\"");
+                let state_clone = state.clone();
+                let result = task::spawn_blocking(move || {
+                    let mut session = state_clone.exasol.lock().map_err(|_| {
+                        ExasolError::Connection("Exasol session lock poisoned".to_owned())
+                    })?;
+                    session.execute(&open_sql)
+                })
+                .await
+                .map_err(|err| pg_error("58000", format!("Exasol execution task failed: {err}")))?
+                .map_err(map_exasol_execution_error);
+                match result {
+                    Ok(_) => {
+                        *state
+                            .current_schema
+                            .lock()
+                            .map_err(|_| pg_error("58000", "session schema lock poisoned"))? =
+                            Some(schema);
+                        Ok(vec![GatewayResponse::Execution {
+                            command: "SET".to_owned(),
+                            rows: None,
+                        }])
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            StatementPlan::ShowSearchPath => {
+                let state = client
+                    .session_extensions()
+                    .get::<SessionState>()
+                    .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
+                let value = state
+                    .current_schema
+                    .lock()
+                    .map_err(|_| pg_error("58000", "session schema lock poisoned"))?
+                    .clone()
+                    .unwrap_or_else(|| "public".to_owned());
+                Ok(vec![GatewayResponse::Query {
+                    columns: vec!["search_path".to_owned()],
+                    rows: vec![vec![Some(value)]],
+                }])
+            }
             StatementPlan::ClientTransactionStart => Ok(vec![GatewayResponse::TransactionStart {
                 command: "BEGIN".to_owned(),
             }]),

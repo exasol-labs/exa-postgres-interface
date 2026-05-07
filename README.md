@@ -68,6 +68,30 @@ For SQL sent by clients, the gateway:
 5. maps Exasol result sets, update counts, and errors back into PostgreSQL
    protocol responses.
 
+### Gateway-Managed Session Commands
+
+Some PostgreSQL session commands are intercepted by the gateway and either
+handled locally or translated into an Exasol equivalent. They never reach the
+Exasol SQL engine directly.
+
+#### `search_path`
+
+The gateway translates `search_path` commands into Exasol schema operations and
+tracks the active schema in per-session state. This fixes a DBeaver NPE
+(`Cannot invoke "java.lang.CharSequence.toString()" because "s" is null`) that
+occurs when a JDBC driver queries schema-dependent metadata without an active
+schema context.
+
+| Form | Gateway behavior |
+| --- | --- |
+| `SET search_path = "MySchema"` | Issues `OPEN SCHEMA "MySchema"` against Exasol and records the schema in session state. Returns PostgreSQL `SET` command tag. |
+| `SET search_path TO my_schema` | Same as above; bare and single-quoted identifiers are accepted in addition to double-quoted ones. |
+| `SET SESSION search_path = "MySchema"` | Identical to the non-`SESSION` form. |
+| `SET search_path = DEFAULT` | No-op; returns `SET`. Exasol has no "close schema" verb. |
+| `RESET search_path` | No-op; returns `SET`. |
+| `SHOW search_path` | Returns the currently active schema recorded in session state, or `public` if none has been set. |
+| `SET search_path = a, b, ...` | Rejected with sqlstate `0A000` (feature not supported). Exasol cannot honor multiple simultaneously active schemas; the error message states that only a single-schema search path is supported. |
+
 PostgreSQL metadata compatibility is split between the gateway and Exasol:
 
 * `sql/postgres_catalog_compatibility.sql` installs `PG_CATALOG` and

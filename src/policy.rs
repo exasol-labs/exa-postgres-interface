@@ -8,6 +8,10 @@ pub enum StatementPlan {
         row_count: RowCountPolicy,
     },
     ClientSet,
+    SetSearchPath {
+        schema: String,
+    },
+    ShowSearchPath,
     ClientTransactionStart,
     ClientTransactionEnd {
         command: &'static str,
@@ -97,6 +101,9 @@ static RESET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^RESET\s+(ALL|[A-Za-z_][A-Za-z0-9_.]*)$").unwrap());
 static SHOW_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^SHOW\s+([A-Za-z_][A-Za-z0-9_ .-]*)$").unwrap());
+static SET_SEARCH_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^SET\s+(?:SESSION\s+)?search_path\s*(?:=|TO\b)\s*(.+)$").unwrap()
+});
 static DECLARE_CURSOR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?is)^DECLARE\s+(?P<name>"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s+(?P<options>(?:(?:BINARY|INSENSITIVE|ASENSITIVE|NO\s+SCROLL|SCROLL)\s+)*)CURSOR\s*(?P<hold>WITH\s+HOLD|WITHOUT\s+HOLD)?\s+FOR\s+(?P<query>.+)$"#,
@@ -108,6 +115,24 @@ pub fn classify_statement(sql: &str) -> StatementPlan {
     let cleaned = normalize_sql(sql);
     if cleaned.is_empty() {
         return StatementPlan::Empty;
+    }
+
+    if let Some(cap) = SET_SEARCH_PATH_RE.captures(&cleaned) {
+        let rhs = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        return match parse_search_path_value(rhs) {
+            SearchPathTarget::Single(schema) => StatementPlan::SetSearchPath { schema },
+            SearchPathTarget::Default => StatementPlan::ClientSet,
+            SearchPathTarget::Multi => StatementPlan::Reject {
+                sqlstate: "0A000",
+                message:
+                    "search_path supports only a single schema; multi-schema search paths are not supported"
+                        .to_owned(),
+            },
+            SearchPathTarget::Invalid => StatementPlan::Reject {
+                sqlstate: "42601",
+                message: "invalid search_path value".to_owned(),
+            },
+        };
     }
 
     if is_safe_set(&cleaned) || RESET_RE.is_match(&cleaned) {
@@ -470,6 +495,98 @@ fn second_keyword(sql: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchPathTarget {
+    Single(String),
+    Default,
+    Multi,
+    Invalid,
+}
+
+fn parse_search_path_value(rhs: &str) -> SearchPathTarget {
+    let trimmed = rhs.trim();
+    if trimmed.is_empty() {
+        return SearchPathTarget::Invalid;
+    }
+
+    // Detect a top-level comma (a comma not inside any quoted segment).
+    // We must consult the structure of the string to avoid false positives
+    // like `"a, b"` (one schema named `a, b`) and `'a, b'` (likewise).
+    if has_top_level_comma(trimmed) {
+        return SearchPathTarget::Multi;
+    }
+
+    // Bare identifier `DEFAULT` (case-insensitive, unquoted) acts as a
+    // reset to the server default and is treated as a generic ClientSet.
+    if trimmed.eq_ignore_ascii_case("DEFAULT") {
+        return SearchPathTarget::Default;
+    }
+
+    // Double-quoted identifier: strip enclosing quotes and unescape `""`.
+    if let Some(inner) = strip_enclosing(trimmed, '"', '"') {
+        let unescaped = inner.replace("\"\"", "\"");
+        if unescaped.is_empty() {
+            return SearchPathTarget::Invalid;
+        }
+        return SearchPathTarget::Single(unescaped);
+    }
+
+    // Single-quoted string literal: strip enclosing quotes.
+    if let Some(inner) = strip_enclosing(trimmed, '\'', '\'') {
+        if inner.is_empty() {
+            return SearchPathTarget::Invalid;
+        }
+        return SearchPathTarget::Single(inner.to_owned());
+    }
+
+    // Bare identifier: take it as-is.
+    SearchPathTarget::Single(trimmed.to_owned())
+}
+
+fn has_top_level_comma(value: &str) -> bool {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if !in_single => {
+                // Handle `""` escape inside a double-quoted segment by
+                // consuming the second quote so we stay inside the segment.
+                if in_double && chars.peek() == Some(&'"') {
+                    chars.next();
+                } else {
+                    in_double = !in_double;
+                }
+            }
+            '\'' if !in_double => {
+                if in_single && chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    in_single = !in_single;
+                }
+            }
+            ',' if !in_double && !in_single => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn strip_enclosing(value: &str, open: char, close: char) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let first = value.chars().next()?;
+    let last = value.chars().next_back()?;
+    if first != open || last != close {
+        return None;
+    }
+    let start = first.len_utf8();
+    let end = value.len() - last.len_utf8();
+    Some(&value[start..end])
+}
+
 fn is_safe_set(sql: &str) -> bool {
     if Regex::new(r"(?i)^SET\s+SESSION\s+CHARACTERISTICS\s+AS\s+TRANSACTION\b")
         .unwrap()
@@ -490,6 +607,9 @@ fn local_show(sql: &str) -> Option<StatementPlan> {
     let cap = SHOW_RE.captures(sql)?;
     let raw_name = cap.get(1)?.as_str().trim();
     let key = raw_name.replace([' ', '-'], "_").to_ascii_lowercase();
+    if key == "search_path" {
+        return Some(StatementPlan::ShowSearchPath);
+    }
     let value = match key.as_str() {
         "datestyle" => "ISO, YMD",
         "timezone" | "time_zone" => "Etc/UTC",
@@ -499,7 +619,6 @@ fn local_show(sql: &str) -> Option<StatementPlan> {
         "client_encoding" => "UTF8",
         "server_version" => "16.6-exasol-gateway",
         "application_name" => "",
-        "search_path" => "public",
         _ => return None,
     };
     Some(StatementPlan::ClientShow {
@@ -524,9 +643,6 @@ fn local_select(sql: &str) -> Option<StatementPlan> {
     }
     if lower == "select current_catalog" || lower == "select current_catalog()" {
         return Some(single_value("current_catalog", "exasol"));
-    }
-    if lower == "select current_schema()" {
-        return Some(single_value("current_schema", "public"));
     }
     if lower == "select current_user" || lower == "select user" {
         return Some(single_value("current_user", "sys"));
@@ -887,6 +1003,72 @@ mod tests {
                 command: "SELECT",
                 row_count: RowCountPolicy::Omit
             }
+        );
+    }
+
+    #[test]
+    fn classifies_set_search_path_single_schema() {
+        assert_eq!(
+            classify_statement(r#"SET search_path = "DEMO_FINANCE""#),
+            StatementPlan::SetSearchPath {
+                schema: "DEMO_FINANCE".to_owned()
+            }
+        );
+        assert_eq!(
+            classify_statement("SET search_path TO demo_finance"),
+            StatementPlan::SetSearchPath {
+                schema: "demo_finance".to_owned()
+            }
+        );
+        assert_eq!(
+            classify_statement("SET SESSION search_path = 'pg_demo'"),
+            StatementPlan::SetSearchPath {
+                schema: "pg_demo".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_set_search_path_multi_schema() {
+        assert!(matches!(
+            classify_statement("SET search_path = pg_demo, pg_catalog"),
+            StatementPlan::Reject { message, .. } if message.contains("single schema")
+        ));
+    }
+
+    #[test]
+    fn handles_search_path_reset_and_default() {
+        assert_eq!(
+            classify_statement("SET search_path = DEFAULT"),
+            StatementPlan::ClientSet
+        );
+        assert_eq!(
+            classify_statement("RESET search_path"),
+            StatementPlan::ClientSet
+        );
+    }
+
+    #[test]
+    fn classifies_show_search_path_dynamically() {
+        assert_eq!(
+            classify_statement("SHOW search_path"),
+            StatementPlan::ShowSearchPath
+        );
+    }
+
+    #[test]
+    fn other_set_statements_still_classify_as_client_set() {
+        assert_eq!(
+            classify_statement("SET application_name = 'myapp'"),
+            StatementPlan::ClientSet
+        );
+        assert_eq!(
+            classify_statement("SET extra_float_digits = 3"),
+            StatementPlan::ClientSet
+        );
+        assert_eq!(
+            classify_statement("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"),
+            StatementPlan::ClientSet
         );
     }
 
