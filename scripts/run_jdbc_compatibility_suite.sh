@@ -39,7 +39,7 @@ fi
 javac \
     -cp "${JDBC_JAR}" \
     -d "${BUILD_DIR}" \
-    "${REPO_ROOT}/tests/jdbc/PgJdbcCompatibilitySuite.java"
+    "${REPO_ROOT}"/tests/jdbc/*.java
 
 java \
     -cp "${JDBC_JAR}:${BUILD_DIR}" \

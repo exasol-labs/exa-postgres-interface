@@ -99,6 +99,7 @@ public class PgJdbcCompatibilitySuite {
     }
 
     private static void runSqlProbes(Config config, SampleNames sample, Reporter reporter) throws Exception {
+        validateProvenanceInvariants(QueryProbe.corpus(sample));
         reporter.section("SQL Probes");
         for (QueryProbe probe : QueryProbe.corpus(sample)) {
             if (!config.shouldRunPersona(probe.persona)) {
@@ -110,10 +111,27 @@ public class PgJdbcCompatibilitySuite {
                     probe.persona,
                     probe.id,
                     probe.expectation,
-                    executeProbe(conn, probe, sample)
+                    executeProbe(conn, probe, sample) + probe.provenanceSuffix()
                 );
             } catch (Throwable ex) {
-                reporter.recordFailure(probe.persona, probe.id, probe.expectation, ex);
+                reporter.recordFailure(probe.persona, probe.id, probe.expectation, ex, probe.provenanceSuffix());
+            }
+        }
+    }
+
+    private static void validateProvenanceInvariants(List<QueryProbe> probes) {
+        for (QueryProbe probe : probes) {
+            if (probe.upstreamProject == null) {
+                continue;
+            }
+            if (probe.upstreamFile == null || probe.upstreamSha == null || probe.upstreamLicense == null) {
+                throw new IllegalStateException(
+                    "Mined probe '" + probe.persona + "/" + probe.id
+                        + "' has a non-null upstreamProject but is missing one or more provenance fields"
+                        + " (upstreamFile=" + probe.upstreamFile
+                        + ", upstreamSha=" + probe.upstreamSha
+                        + ", upstreamLicense=" + probe.upstreamLicense + ")"
+                );
             }
         }
     }
@@ -278,6 +296,10 @@ public class PgJdbcCompatibilitySuite {
         final List<String> setupSql;
         final List<String> cleanupSql;
         final boolean expectFailure;
+        final String upstreamProject;
+        final String upstreamFile;
+        final String upstreamSha;
+        final String upstreamLicense;
 
         QueryProbe(
             String persona,
@@ -288,7 +310,11 @@ public class PgJdbcCompatibilitySuite {
             StatementBinder binder,
             List<String> setupSql,
             List<String> cleanupSql,
-            boolean expectFailure
+            boolean expectFailure,
+            String upstreamProject,
+            String upstreamFile,
+            String upstreamSha,
+            String upstreamLicense
         ) {
             this.persona = persona;
             this.id = id;
@@ -299,6 +325,21 @@ public class PgJdbcCompatibilitySuite {
             this.setupSql = setupSql;
             this.cleanupSql = cleanupSql;
             this.expectFailure = expectFailure;
+            this.upstreamProject = upstreamProject;
+            this.upstreamFile = upstreamFile;
+            this.upstreamSha = upstreamSha;
+            this.upstreamLicense = upstreamLicense;
+        }
+
+        /** Returns a provenance suffix string for report lines, or empty string for hand-curated probes. */
+        String provenanceSuffix() {
+            if (upstreamProject == null) {
+                return "";
+            }
+            return " upstream_project=" + upstreamProject
+                + " upstream_file=" + upstreamFile
+                + " upstream_sha=" + upstreamSha
+                + " upstream_license=" + upstreamLicense;
         }
 
         static List<QueryProbe> corpus(SampleNames sample) {
@@ -356,6 +397,127 @@ public class PgJdbcCompatibilitySuite {
                     + "FROM information_schema.key_column_usage "
                     + "WHERE table_catalog = 'exasol' AND table_schema = 'PG_DEMO' "
                     + "ORDER BY table_name, ordinal_position"));
+
+            // mined from Metabase upstream source
+            // upstream commit: 8c932afa0b1d37cdfa6994a9fe32f57e74d93fa2 (master branch, May 2026)
+            // AGPL-3.0: derived from Metabase (https://github.com/metabase/metabase)
+            // See tests/jdbc/upstream-mined/metabase/LICENSE-AGPL.txt
+            // Verbatim string literal from enum-types in postgres.clj.
+            probes.add(mined(
+                "metabase",
+                "mined-pg-enum-types",
+                "SELECT nspname, typname "
+                    + "FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
+                    + "WHERE t.oid IN (SELECT DISTINCT enumtypid FROM pg_enum e)",
+                "metabase",
+                "src/metabase/driver/postgres.clj#L174",
+                "8c932afa0b1d37cdfa6994a9fe32f57e74d93fa2",
+                "AGPL-3.0-only"
+            ));
+            // AGPL-3.0: derived from Metabase (https://github.com/metabase/metabase)
+            // See tests/jdbc/upstream-mined/metabase/LICENSE-AGPL.txt
+            // Verbatim string literal from db-default-timezone in postgres.clj
+            // (issued via JDBC PreparedStatement at session start).
+            probes.add(mined(
+                "metabase",
+                "mined-show-timezone",
+                "show timezone;",
+                "metabase",
+                "src/metabase/driver/postgres.clj#L120",
+                "8c932afa0b1d37cdfa6994a9fe32f57e74d93fa2",
+                "AGPL-3.0-only"
+            ));
+            // AGPL-3.0: derived from Metabase (https://github.com/metabase/metabase)
+            // See tests/jdbc/upstream-mined/metabase/LICENSE-AGPL.txt
+            // Verbatim parameterized string literal from memoized-quote-identifier in
+            // postgres.clj. Metabase invokes this on every query that needs to quote
+            // a role/identifier; the parameter is the identifier text itself.
+            probes.add(minedPrepared(
+                "metabase",
+                "mined-quote-ident",
+                "SELECT quote_ident(?);",
+                new StatementBinder() {
+                    @Override
+                    public void bind(PreparedStatement stmt, SampleNames names) throws SQLException {
+                        stmt.setString(1, names.schema);
+                    }
+                },
+                "metabase",
+                "src/metabase/driver/postgres.clj#L1182",
+                "8c932afa0b1d37cdfa6994a9fe32f57e74d93fa2",
+                "AGPL-3.0-only"
+            ));
+            // AGPL-3.0: derived from Metabase (https://github.com/metabase/metabase)
+            // See tests/jdbc/upstream-mined/metabase/LICENSE-AGPL.txt
+            // SQL generated by the HoneySQL form in get-tables-sql in postgres.clj
+            // (this driver method has no string literal; the SQL below is the
+            // dialect=:ansi rendering of the upstream :select / :from / :join /
+            // :left-join / :where / :order-by map). Used by Metabase's table sync
+            // to enumerate user-visible tables, views, partitioned tables, foreign
+            // tables, and materialized views, excluding pg_* and information_schema.
+            probes.add(mined(
+                "metabase",
+                "mined-get-tables",
+                "SELECT n.nspname AS \"schema\", c.relname AS \"name\", "
+                    + "CASE c.relkind "
+                    + "WHEN 'r' THEN 'TABLE' "
+                    + "WHEN 'p' THEN 'PARTITIONED TABLE' "
+                    + "WHEN 'v' THEN 'VIEW' "
+                    + "WHEN 'f' THEN 'FOREIGN TABLE' "
+                    + "WHEN 'm' THEN 'MATERIALIZED VIEW' "
+                    + "ELSE NULL END AS \"type\", "
+                    + "d.description AS \"description\", "
+                    + "NULLIF(stat.n_live_tup, 0) AS \"estimated_row_count\" "
+                    + "FROM pg_catalog.pg_class c "
+                    + "JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid "
+                    + "LEFT JOIN pg_catalog.pg_description d "
+                    + "ON c.oid = d.objoid AND d.objsubid = 0 "
+                    + "LEFT JOIN pg_stat_user_tables stat "
+                    + "ON n.nspname = stat.schemaname AND c.relname = stat.relname "
+                    + "WHERE c.relnamespace = n.oid "
+                    + "AND n.nspname !~ '^pg_' "
+                    + "AND n.nspname <> 'information_schema' "
+                    + "AND c.relkind IN ('r', 'p', 'v', 'f', 'm') "
+                    + "ORDER BY \"type\", \"schema\", \"name\"",
+                "metabase",
+                "src/metabase/driver/postgres.clj#L160",
+                "8c932afa0b1d37cdfa6994a9fe32f57e74d93fa2",
+                "AGPL-3.0-only"
+            ));
+            // AGPL-3.0: derived from Metabase (https://github.com/metabase/metabase)
+            // See tests/jdbc/upstream-mined/metabase/LICENSE-AGPL.txt
+            // SQL generated by the HoneySQL form in the :postgres
+            // describe-fks-sql defmethod in postgres.clj (this method has no
+            // string literal; the SQL below is the rendering of the upstream
+            // :select / :from / :join / :where / :order-by map). Used by
+            // Metabase's foreign-key sync to enumerate FK constraints across
+            // user schemas.
+            probes.add(mined(
+                "metabase",
+                "mined-describe-fks",
+                "SELECT fk_ns.nspname AS \"fk-table-schema\", "
+                    + "fk_table.relname AS \"fk-table-name\", "
+                    + "fk_column.attname AS \"fk-column-name\", "
+                    + "pk_ns.nspname AS \"pk-table-schema\", "
+                    + "pk_table.relname AS \"pk-table-name\", "
+                    + "pk_column.attname AS \"pk-column-name\" "
+                    + "FROM pg_constraint c "
+                    + "JOIN pg_class fk_table ON c.conrelid = fk_table.oid "
+                    + "JOIN pg_namespace fk_ns ON c.connamespace = fk_ns.oid "
+                    + "JOIN pg_attribute fk_column ON c.conrelid = fk_column.attrelid "
+                    + "JOIN pg_class pk_table ON c.confrelid = pk_table.oid "
+                    + "JOIN pg_namespace pk_ns ON pk_table.relnamespace = pk_ns.oid "
+                    + "JOIN pg_attribute pk_column ON c.confrelid = pk_column.attrelid "
+                    + "WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_' "
+                    + "AND c.contype = 'f'::char "
+                    + "AND fk_column.attnum = ANY(c.conkey) "
+                    + "AND pk_column.attnum = ANY(c.confkey) "
+                    + "ORDER BY \"fk-table-schema\", \"fk-table-name\"",
+                "metabase",
+                "src/metabase/driver/postgres.clj#L279",
+                "8c932afa0b1d37cdfa6994a9fe32f57e74d93fa2",
+                "AGPL-3.0-only"
+            ));
 
             probes.add(prepared("dbeaver", "database-lookup", Expectation.EXPLORATORY,
                 "SELECT db.oid,db.* FROM pg_catalog.pg_database db WHERE datname=?",
@@ -430,6 +592,64 @@ public class PgJdbcCompatibilitySuite {
                         stmt.setString(1, names.schema);
                     }
                 }));
+
+            // mined from DBeaver upstream source
+            // upstream commit: eb961ed75130078e621fada1f49a4e593d0ce72a (devel branch, May 2026)
+            // license: Apache-2.0 (DBeaver Community Edition)
+            probes.add(mined(
+                "dbeaver",
+                "mined-pg-collation",
+                "SELECT c.oid,c.* FROM pg_catalog.pg_collation c \nORDER BY c.oid",
+                "dbeaver",
+                "plugins/org.jkiss.dbeaver.ext.postgresql/src/org/jkiss/dbeaver/ext/postgresql/model/PostgreDatabase.java",
+                "eb961ed75130078e621fada1f49a4e593d0ce72a",
+                "Apache-2.0"
+            ));
+            probes.add(mined(
+                "dbeaver",
+                "mined-pg-tablespace",
+                "SELECT t.oid,t.* \nFROM pg_catalog.pg_tablespace t \nORDER BY t.oid",
+                "dbeaver",
+                "plugins/org.jkiss.dbeaver.ext.postgresql/src/org/jkiss/dbeaver/ext/postgresql/model/PostgreDatabase.java",
+                "eb961ed75130078e621fada1f49a4e593d0ce72a",
+                "Apache-2.0"
+            ));
+            probes.add(mined(
+                "dbeaver",
+                "mined-pg-roles",
+                "SELECT a.oid,a.* FROM pg_catalog.pg_roles a \nORDER BY a.rolname",
+                "dbeaver",
+                "plugins/org.jkiss.dbeaver.ext.postgresql/src/org/jkiss/dbeaver/ext/postgresql/model/PostgreDatabase.java",
+                "eb961ed75130078e621fada1f49a4e593d0ce72a",
+                "Apache-2.0"
+            ));
+            probes.add(mined(
+                "dbeaver",
+                "mined-pg-language",
+                "SELECT l.oid,l.* FROM pg_catalog.pg_language l \nORDER BY l.oid",
+                "dbeaver",
+                "plugins/org.jkiss.dbeaver.ext.postgresql/src/org/jkiss/dbeaver/ext/postgresql/model/PostgreDatabase.java",
+                "eb961ed75130078e621fada1f49a4e593d0ce72a",
+                "Apache-2.0"
+            ));
+            probes.add(minedPrepared(
+                "dbeaver",
+                "mined-pg-event-trigger",
+                "SELECT evtenabled FROM pg_catalog.pg_event_trigger WHERE oid=?",
+                new StatementBinder() {
+                    @Override
+                    public void bind(PreparedStatement stmt, SampleNames names) throws SQLException {
+                        // Bind a known-empty oid value: real DBeaver code passes the oid of a
+                        // specific event trigger; here the probe just verifies the query parses
+                        // and executes against the gateway's pg_event_trigger view.
+                        stmt.setLong(1, 0L);
+                    }
+                },
+                "dbeaver",
+                "plugins/org.jkiss.dbeaver.ext.postgresql/src/org/jkiss/dbeaver/ext/postgresql/model/PostgreEventTrigger.java",
+                "eb961ed75130078e621fada1f49a4e593d0ce72a",
+                "Apache-2.0"
+            ));
 
             probes.add(simple("analyst", "grouping-and-having", Expectation.EXPLORATORY,
                 "SELECT customer_name, SUM(amount) AS total_amount "
@@ -587,7 +807,8 @@ public class PgJdbcCompatibilitySuite {
                 NoOpBinder.INSTANCE,
                 Collections.<String>emptyList(),
                 Collections.<String>emptyList(),
-                false
+                false,
+                null, null, null, null
             );
         }
 
@@ -607,7 +828,8 @@ public class PgJdbcCompatibilitySuite {
                 binder,
                 Collections.<String>emptyList(),
                 Collections.<String>emptyList(),
-                false
+                false,
+                null, null, null, null
             );
         }
 
@@ -627,7 +849,8 @@ public class PgJdbcCompatibilitySuite {
                 NoOpBinder.INSTANCE,
                 Collections.<String>emptyList(),
                 cleanupSql,
-                false
+                false,
+                null, null, null, null
             );
         }
 
@@ -639,12 +862,71 @@ public class PgJdbcCompatibilitySuite {
             List<String> setupSql,
             List<String> cleanupSql
         ) {
-            return new QueryProbe(persona, id, expectation, false, sql, NoOpBinder.INSTANCE, setupSql, cleanupSql, false);
+            return new QueryProbe(
+                persona, id, expectation, false, sql, NoOpBinder.INSTANCE, setupSql, cleanupSql, false,
+                null, null, null, null
+            );
         }
 
         static QueryProbe expectingFailure(String persona, String id, String sql) {
-            return new QueryProbe(persona, id, Expectation.MUST_PASS, false, sql,
-                NoOpBinder.INSTANCE, Collections.<String>emptyList(), Collections.<String>emptyList(), true);
+            return new QueryProbe(
+                persona, id, Expectation.MUST_PASS, false, sql,
+                NoOpBinder.INSTANCE, Collections.<String>emptyList(), Collections.<String>emptyList(), true,
+                null, null, null, null
+            );
+        }
+
+        static QueryProbe mined(
+            String persona,
+            String id,
+            String sql,
+            String upstreamProject,
+            String upstreamFile,
+            String upstreamSha,
+            String upstreamLicense
+        ) {
+            return new QueryProbe(
+                persona,
+                id,
+                Expectation.EXPLORATORY,
+                false,
+                sql,
+                NoOpBinder.INSTANCE,
+                Collections.<String>emptyList(),
+                Collections.<String>emptyList(),
+                false,
+                upstreamProject,
+                upstreamFile,
+                upstreamSha,
+                upstreamLicense
+            );
+        }
+
+        static QueryProbe minedPrepared(
+            String persona,
+            String id,
+            String sql,
+            StatementBinder binder,
+            String upstreamProject,
+            String upstreamFile,
+            String upstreamSha,
+            String upstreamLicense
+        ) {
+            return new QueryProbe(
+                persona,
+                id,
+                Expectation.EXPLORATORY,
+                true,
+                sql,
+                binder,
+                Collections.<String>emptyList(),
+                Collections.<String>emptyList(),
+                false,
+                upstreamProject,
+                upstreamFile,
+                upstreamSha,
+                upstreamLicense
+            );
         }
 
         static List<String> setup(String... statements) {
@@ -940,6 +1222,10 @@ public class PgJdbcCompatibilitySuite {
         }
 
         void recordFailure(String group, String id, Expectation expectation, Throwable failure) {
+            recordFailure(group, id, expectation, failure, "");
+        }
+
+        void recordFailure(String group, String id, Expectation expectation, Throwable failure, String provenanceSuffix) {
             Throwable root = rootCause(failure);
             StringBuilder detail = new StringBuilder();
             if (root instanceof SQLException) {
@@ -951,6 +1237,7 @@ public class PgJdbcCompatibilitySuite {
             } else {
                 detail.append("message=").append(sanitize(root.getMessage()));
             }
+            detail.append(provenanceSuffix);
 
             if (expectation == Expectation.MUST_PASS) {
                 mustPassFailures++;

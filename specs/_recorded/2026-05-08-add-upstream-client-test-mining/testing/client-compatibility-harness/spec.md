@@ -1,6 +1,6 @@
 # Feature: Client Compatibility Harness
 
-Status as of 2026-05-08: extended with provenance metadata, license-aware upstream corpora, and per-tool baseline-promotion specification. The harness includes JDBC metadata sweeps, persona query corpora, a gateway-vs-direct Exasol benchmark, and investigation-level scenarios produced by the `add-upstream-client-test-mining` plan. Full corpora and the baseline-promotion machinery are deferred to follow-up plans.
+Status as of 2026-05-08: existing harness is being extended with provenance, license-aware corpora, and per-tool baseline promotion. This delta adds investigation-level scenarios produced by the `add-upstream-client-test-mining` plan; full corpora and the baseline-promotion machinery are deferred to follow-up plans.
 
 The repository SHALL provide a repeatable compatibility harness for the PostgreSQL gateway. The harness SHALL report which JDBC metadata calls and PostgreSQL-flavored statement families succeed, fail, or degrade for realistic client personas without assuming full PostgreSQL compatibility. The repository SHALL also provide a repeatable latency benchmark that compares gateway query execution against direct Exasol JDBC for logically equivalent read-heavy queries.
 
@@ -15,79 +15,7 @@ The repository SHALL provide a repeatable compatibility harness for the PostgreS
 
 ## Scenarios
 
-### Scenario: Compatibility suite sweeps JDBC metadata exhaustively
-
-* *GIVEN* a running gateway reachable through PostgreSQL JDBC
-* *WHEN* the operator runs the compatibility suite
-* *THEN* the suite SHALL attempt every public `java.sql.DatabaseMetaData` method with deterministic sample arguments
-* *AND* the suite SHALL record whether each method passed or failed
-* *AND* the suite SHALL record result-set shape or scalar return values when the call succeeds
-* *AND* the suite SHALL record SQLState and failure details when the call fails
-
-
-### Scenario: Persona query corpora mix must-pass and exploratory probes
-
-* *GIVEN* the compatibility suite has a configured sample catalog, schema, and table
-* *WHEN* the suite runs its SQL probes
-* *THEN* the suite SHALL include a small must-pass baseline for current gateway smoke behavior
-* *AND* the suite SHALL include exploratory probes for additional PostgreSQL client personas and stress cases
-* *AND* exploratory failures SHALL be reported without being treated as must-pass regressions by default
-
-
-### Scenario: Query personas reflect real PostgreSQL clients
-
-* *GIVEN* the team wants representative client coverage
-* *WHEN* the suite defines SQL probe families
-* *THEN* the suite SHALL include query families informed by pgJDBC, DbVisualizer, Metabase, and DBeaver behavior
-* *AND* the documentation SHALL identify which upstream tools informed each persona
-* *AND* the suite MAY add analyst-oriented PostgreSQL `SELECT` stress cases beyond the observed client corpora
-* *AND* the suite SHOULD also include representative DML, DDL, transaction, session, and utility operations so unsupported non-read behavior is visible in the same report
-
-
-### Scenario: SQL probes cover mixed statement kinds
-
-* *GIVEN* PostgreSQL clients issue more than just `SELECT` statements
-* *WHEN* the compatibility suite runs its SQL corpus
-* *THEN* the suite SHALL support probes that return result sets and probes that return update counts or no rows
-* *AND* the suite SHALL support DQL, DML, DDL, transaction-control, session, and utility statements in the same framework
-* *AND* the suite SHOULD allow per-probe setup and cleanup SQL when a statement family requires scratch objects or transaction context
-
-
-### Scenario: Individual probe failures do not stop discovery
-
-* *GIVEN* one metadata call or SQL probe fails
-* *WHEN* later probes remain runnable
-* *THEN* the suite SHALL continue collecting outcomes for the remaining probes
-* *AND* the final report SHALL separate must-pass failures from exploratory failures
-* *AND* the report SHOULD help the team identify unsupported PostgreSQL statement families instead of hiding them behind the first exception
-
-
-### Scenario: Operators can run the suite with a single command
-
-* *GIVEN* the operator has a PostgreSQL JDBC URL and Exasol credentials
-* *WHEN* they run the documented compatibility-suite command
-* *THEN* the repository SHALL provide a script or equivalent documented entry point that compiles and runs the suite
-* *AND* the run path SHALL support the extended JDBC query mode used by many Java tools
-
-
-### Scenario: Benchmark compares gateway latency with direct Exasol JDBC
-
-* *GIVEN* the operator has both a PostgreSQL gateway JDBC URL and a direct Exasol JDBC URL that reach the same sample data
-* *WHEN* they run the documented benchmark command
-* *THEN* the repository SHALL execute logically equivalent read-heavy query pairs against both targets
-* *AND* the benchmark SHALL measure execution latency over repeated warm-connection runs
-* *AND* the report SHALL include summary statistics for both targets plus a gateway-over-direct overhead ratio
-
-
-### Scenario: Benchmark validates result equivalence before comparing latency
-
-* *GIVEN* the benchmark runs equivalent query pairs against the gateway and direct Exasol
-* *WHEN* the pair completes successfully on both sides
-* *THEN* the benchmark SHALL compare a deterministic result digest for both targets
-* *AND* the benchmark SHALL flag pairs where the gateway and direct Exasol results do not match
-* *AND* the latency comparison SHOULD remain tied to logically equivalent successful query results
-
-
+<!-- DELTA:NEW -->
 ### Scenario: Mined probes carry upstream provenance metadata
 
 * *GIVEN* the compatibility suite includes probes derived from open-source client source code
@@ -95,8 +23,9 @@ The repository SHALL provide a repeatable compatibility harness for the PostgreS
 * *THEN* the probe SHALL carry a provenance record naming the upstream project, source file path, upstream commit SHA or tag, and upstream license identifier
 * *AND* the provenance record SHALL be visible in the suite report for every mined probe outcome
 * *AND* the documentation SHALL state that hand-curated probes without an upstream source MAY omit the provenance fields
+<!-- /DELTA:NEW -->
 
-
+<!-- DELTA:NEW -->
 ### Scenario: Mined corpora are stored according to upstream license
 
 * *GIVEN* the team mines SQL strings from upstream client source code
@@ -105,8 +34,9 @@ The repository SHALL provide a repeatable compatibility harness for the PostgreS
 * *AND* probes mined from Apache 2.0 sources MAY live alongside the existing Apache-compatible test code with attribution comments
 * *AND* probes mined from AGPL-3.0 sources SHALL be isolated in a directory whose `README` or `LICENSE` notice declares AGPL-3.0 inheritance for that directory only
 * *AND* the build tooling MUST NOT bundle AGPL-derived probe text into the gateway runtime artifact
+<!-- /DELTA:NEW -->
 
-
+<!-- DELTA:NEW -->
 ### Scenario: Investigation produces an ADR comparing mining and synthetic-pgJDBC approaches
 
 * *GIVEN* the team is evaluating how to expand client compatibility coverage
@@ -115,8 +45,9 @@ The repository SHALL provide a repeatable compatibility harness for the PostgreS
 * *AND* the ADR SHALL document the AGPL handling decision for Metabase-derived corpora
 * *AND* the ADR SHALL enumerate concrete pgJDBC behavioral surfaces (extended query protocol, parameter-status messages, prepared-statement describe round-trips, server-side cursors, error class-codes) that synthetic coverage SHOULD address in follow-up plans
 * *AND* the ADR SHALL identify the follow-up plans required to deliver full corpora and baseline-promotion machinery
+<!-- /DELTA:NEW -->
 
-
+<!-- DELTA:NEW -->
 ### Scenario: Proof-of-concept demonstrates mining is tractable
 
 * *GIVEN* the investigation includes a small proof-of-concept
@@ -125,8 +56,9 @@ The repository SHALL provide a repeatable compatibility harness for the PostgreS
 * *AND* the corpus SHALL include at least five probes mined from Metabase upstream source with full provenance
 * *AND* the proof-of-concept probes SHALL run under the existing single-command compatibility-suite entry point without manual extra steps
 * *AND* failures of proof-of-concept probes SHALL be reported as exploratory and MUST NOT cause MUST-PASS regression
+<!-- /DELTA:NEW -->
 
-
+<!-- DELTA:NEW -->
 ### Scenario: Per-tool baseline promotion mechanism is specified
 
 * *GIVEN* an exploratory probe for a specific client tool has passed at least once in CI
@@ -134,3 +66,4 @@ The repository SHALL provide a repeatable compatibility harness for the PostgreS
 * *THEN* the harness SHALL define an observable mechanism for marking a probe as a regression-baseline for a specific tool, separate from the current global MUST-PASS set
 * *AND* the harness SHALL distinguish promoted-probe failures from MUST-PASS failures and from exploratory failures in the final report
 * *AND* the implementation of the promotion mechanism MAY be deferred to a follow-up plan, but the specification SHALL be in place before that plan begins
+<!-- /DELTA:NEW -->

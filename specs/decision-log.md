@@ -86,3 +86,117 @@ When `parse_search_path_value` detects a top-level comma in the right-hand side 
 ### Consequences
 
 Clients that issue multi-schema `SET search_path` receive a clear error and can adapt. The session remains usable for subsequent statements. Implementing multi-schema emulation in a future plan does not require changing this decision — it would introduce a new classifier branch before the rejection arm.
+
+---
+
+## ADR-004: Adopt upstream-source mining and synthetic pgJDBC coverage as complementary approaches
+
+**Date:** 2026-05-08
+**Plan:** `add-upstream-client-test-mining`
+**Status:** Accepted
+
+### Context
+
+Real DBeaver and Metabase sessions surface gateway errors that the existing hand-curated probes miss. The team needed to decide how to systematically expand compatibility coverage: mine SQL from upstream open-source client source code, generate synthetic probes that exercise pgJDBC protocol surfaces (extended-query round-trips, parameter-status, cursors, SQLSTATE), capture live wire traffic, or run upstream test suites directly against the gateway. Live wire-traffic capture and running upstream suites were explicitly rejected by the user.
+
+### Decision
+
+Adopt both upstream-source mining (near-term primary approach) and synthetic pgJDBC protocol coverage (follow-up plan). Mining catches tool-specific SQL the team observes failing in real sessions. Synthetic coverage catches protocol-level surfaces that tool source code does not expose as plain SQL text.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Mining + synthetic pgJDBC, both adopted | Chosen — mining and synthetic address complementary coverage gaps; sequencing mining first lets the team validate feasibility before designing the synthetic layer |
+| Mining only | Rejected — misses protocol-level surfaces (extended-query round-trips, parameter-status, prepared-statement describe, cursors, SQLSTATE) that no upstream SQL text can expose |
+| Synthetic only | Rejected — misses the tool-specific SQL idioms that are the proximate cause of current field errors |
+| Live wire-traffic capture | Rejected by user — operational complexity, privacy concerns, non-determinism |
+| Run upstream test suites directly | Rejected by user — upstream suites assume a real PostgreSQL target; they would produce false failures unrelated to gateway compatibility |
+
+### Consequences
+
+The compatibility corpus grows along two independent axes. Mining follow-up plans (`add-dbeaver-mined-corpus`, `add-metabase-mined-corpus`) deliver full per-tool SQL coverage. A synthetic follow-up plan (`add-synthetic-pgjdbc-protocol-coverage`) addresses protocol-level surfaces. Both families plug into the same single-command harness entry point.
+
+---
+
+## ADR-005: Isolate Metabase-derived probes in an AGPL-3.0-declared directory
+
+**Date:** 2026-05-08
+**Plan:** `add-upstream-client-test-mining`
+**Status:** Accepted
+
+### Context
+
+Metabase is distributed under AGPL-3.0. SQL strings extracted from Metabase source may carry the AGPL license. The team needed a policy that removes ambiguity about whether AGPL-derived text enters the gateway runtime artifact and avoids complicating the repository's overall license posture.
+
+### Decision
+
+Metabase-derived probes live exclusively under `tests/jdbc/upstream-mined/metabase/`. That directory contains a `README.md` and a `LICENSE-AGPL.txt` declaring AGPL-3.0 inheritance for that directory only. Build tooling MUST NOT bundle that directory into the gateway runtime artifact. The policy is reversible if a future legal review concludes the SQL strings are non-copyrightable facts under scenes-à-faire.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| AGPL-isolated directory with explicit LICENSE notice | Chosen — conservative, removes build-artifact ambiguity, easy to relax later |
+| Treat SQL fragments as non-copyrightable facts | Rejected — legal posture is unresolved; acting on this assumption without a formal review creates risk |
+| Abandon Metabase mining entirely | Rejected — Metabase is a first-class target client; losing its SQL coverage is a material gap |
+| Co-locate with Apache 2.0 test code | Rejected — conflates license regions; complicates future artifact audits |
+
+### Consequences
+
+The release artifact remains free of AGPL-derived content. Reviewers can audit Metabase probe provenance by inspecting one directory. Reversing isolation requires removing the LICENSE-AGPL.txt and moving the files — a single PR with no logic changes.
+
+---
+
+## ADR-006: DBeaver-derived probes co-located with attribution comments, no separate license file
+
+**Date:** 2026-05-08
+**Plan:** `add-upstream-client-test-mining`
+**Status:** Accepted
+
+### Context
+
+DBeaver Community Edition is distributed under Apache 2.0, which is permissive and compatible with the repository's existing license posture. The question was whether to mirror Metabase's isolation for symmetry or handle DBeaver differently.
+
+### Decision
+
+DBeaver-derived probes live under `tests/jdbc/upstream-mined/dbeaver/` with attribution comments in each probe file (upstream project, source file path, commit SHA). No separate LICENSE file is needed for that directory.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Attribution comments only, no separate LICENSE | Chosen — Apache 2.0 is compatible; isolation adds friction without legal benefit |
+| Mirror Metabase AGPL isolation for symmetry | Rejected — Apache 2.0 poses no license conflict; symmetry at the cost of friction is not a net gain |
+
+### Consequences
+
+DBeaver probes are reviewable alongside other Apache 2.0-compatible test code. Attribution comments trace each probe to its upstream source. No build-artifact exclusion rule is required for this directory.
+
+---
+
+## ADR-007: Per-tool baseline promotion via checked-in `tests/jdbc/baselines/<tool>.txt` files
+
+**Date:** 2026-05-08
+**Plan:** `add-upstream-client-test-mining`
+**Status:** Accepted
+
+### Context
+
+The team wanted to pin per-tool regression baselines independently of the global must-pass set. An exploratory probe should be promotable to a tool-specific baseline once it has passed in CI, without elevating it to a global must-pass requirement. The mechanism needed to match the user's stated mental model ("pinned once it passes") with minimum machinery.
+
+### Decision
+
+Specify (but defer implementing) a per-tool baseline-promotion mechanism: `tests/jdbc/baselines/<tool>.txt` lists probe IDs that are pinned as regressions for that specific tool. The compatibility-suite reporter classifies outcomes as `must-pass-failure`, `tool-baseline-failure`, `exploratory-failure`, or `pass`. Implementation is delivered by the follow-up plan `add-per-tool-baseline-promotion`.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Checked-in `baselines/<tool>.txt` files | Chosen — matches user's mental model; flat file is easy to review in PRs; tool-baseline membership is orthogonal to the `Expectation` enum |
+| Promote `EXPLORATORY` to `MUST_PASS` globally once a probe passes | Rejected — removes per-tool granularity; a probe that passes for DBeaver but not Metabase would incorrectly gate both |
+| Annotation-based per-tool promotion in source | Rejected — couples baseline state to source changes; requires recompile to update a baseline |
+
+### Consequences
+
+Tool-specific regressions are visible in CI independently of the global must-pass gate. The baseline files are plain text and reviewable in pull requests. The `add-per-tool-baseline-promotion` follow-up plan has a concrete file-path contract and report-classification contract to implement against.

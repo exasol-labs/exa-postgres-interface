@@ -47,6 +47,8 @@ static CURRENT_DATABASE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bcurrent_database\s*\(\s*\)").unwrap());
 static CURRENT_CATALOG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bcurrent_catalog(?:\s*\(\s*\))?").unwrap());
+static CURRENT_SCHEMA_CALL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bcurrent_schema\s*\(\s*\)").unwrap());
 static CURRENT_SCHEMAS_FIRST_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\(?\s*(?:pg_catalog\.)?current_schemas\s*\(\s*true\s*\)\s*\)?\s*\[\s*1\s*\]")
         .unwrap()
@@ -79,6 +81,8 @@ static OBJ_DESCRIPTION_RE: LazyLock<Regex> = LazyLock::new(|| {
 static REGCLASS_LITERAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)'((?:pg_catalog\.)?[A-Za-z_][A-Za-z0-9_]*)'\s*::\s*regclass").unwrap()
 });
+static QUOTE_IDENT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bquote_ident\s*\(\s*([^()]+?)\s*\)").unwrap());
 
 const CATALOG_RELATIONS: &[&str] = &[
     "pg_aggregate",
@@ -282,6 +286,7 @@ fn is_exasol_passthrough_sql(sql: &str) -> bool {
         " current_database(",
         " current_catalog",
         " current_schemas(",
+        " current_schema(",
         " obj_description(",
         " shobj_description(",
         " col_description(",
@@ -295,6 +300,7 @@ fn is_exasol_passthrough_sql(sql: &str) -> bool {
         " array[",
         " regexp_matches(",
         " regexp_replace(",
+        " quote_ident(",
     ];
 
     if postgres_specific_tokens
@@ -716,6 +722,7 @@ WHERE 1 = 0
 
 fn rewrite_pg_catalog(sql: &str) -> String {
     let mut sql = normalize_ansi_quoted_postgres_identifiers(sql);
+    sql = rewrite_quote_ident(&sql);
     sql = rewrite_qualified_operators(&sql);
     sql = rewrite_object_description(&sql);
     sql = PG_IDENTIFY_OBJECT_IDENTITY_RE
@@ -741,6 +748,11 @@ fn rewrite_pg_catalog(sql: &str) -> String {
         .replace_all(&sql, "'exasol'")
         .to_string();
     sql = CURRENT_CATALOG_RE.replace_all(&sql, "'exasol'").to_string();
+    // Exasol exposes CURRENT_SCHEMA as a keyword, not a function. PostgreSQL
+    // clients send `current_schema()` (with parens); drop them.
+    sql = CURRENT_SCHEMA_CALL_RE
+        .replace_all(&sql, "CURRENT_SCHEMA")
+        .to_string();
     sql = CURRENT_SCHEMAS_FIRST_RE
         .replace_all(&sql, "'PG_CATALOG'")
         .to_string();
@@ -886,6 +898,17 @@ fn rewrite_regclass_literals(sql: &str) -> String {
 fn rewrite_qualified_operators(sql: &str) -> String {
     QUALIFIED_OPERATOR_RE
         .replace_all(sql, |cap: &Captures| format!(" {} ", &cap[1]))
+        .to_string()
+}
+
+fn rewrite_quote_ident(sql: &str) -> String {
+    // Exasol has no quote_ident; emulate by always wrapping the argument in
+    // double quotes and doubling any embedded double quotes. Matches the
+    // contract Metabase relies on (output is embedded as an identifier).
+    QUOTE_IDENT_RE
+        .replace_all(sql, |cap: &Captures| {
+            format!("('\"' || REPLACE({}, '\"', '\"\"') || '\"')", cap[1].trim())
+        })
         .to_string()
 }
 
@@ -1130,5 +1153,24 @@ WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
         assert!(translated.contains("PG_CATALOG.PG_USER_MAPPINGS"));
         assert!(translated.contains("PG_CATALOG.\"PG_FOREIGN_SERVER\""));
         assert!(translated.contains("WHERE fs.oid = 42"));
+    }
+
+    #[test]
+    fn rewrites_quote_ident_call_to_concat_expression() {
+        let translated = translate_postgres_to_exasol("SELECT quote_ident($1)").unwrap();
+        assert!(!translated.to_ascii_lowercase().contains("quote_ident"));
+        assert!(translated.contains("REPLACE($1"));
+        assert!(translated.contains("'\"'"));
+    }
+
+    #[test]
+    fn drops_parens_on_current_schema_function_call() {
+        // Exasol exposes CURRENT_SCHEMA as a keyword, not a function. PostgreSQL
+        // clients (and the JDBC driver) send `current_schema()`; we must strip
+        // the parens so Exasol accepts it.
+        let translated = translate_postgres_to_exasol("SELECT current_schema()").unwrap();
+        assert!(translated.to_ascii_uppercase().contains("CURRENT_SCHEMA"));
+        assert!(!translated.contains("current_schema("));
+        assert!(!translated.to_ascii_uppercase().contains("CURRENT_SCHEMA("));
     }
 }
