@@ -373,6 +373,15 @@ public class PgJdbcCompatibilitySuite {
             probes.add(simple("dbvisualizer", "pg-group", Expectation.MUST_PASS, "select * from pg_group"));
             probes.add(simple("dbvisualizer", "pg-stat-activity", Expectation.MUST_PASS, "select * from pg_stat_activity"));
             probes.add(simple("dbvisualizer", "pg-locks", Expectation.MUST_PASS, "select * from pg_locks"));
+            // PostgreSQL-shaped clients (DBeaver, Qlik, etc.) emit three-part
+            // `"exasol"."schema"."table"` references; the gateway must strip
+            // the leading catalog before forwarding the SQL to Exasol.
+            probes.add(simple("dbvisualizer", "three-part-quoted-catalog-reference",
+                Expectation.MUST_PASS,
+                "SELECT order_id FROM \"exasol\".\"PG_DEMO\".\"ORDERS\" ORDER BY order_id LIMIT 1"));
+            probes.add(simple("dbvisualizer", "three-part-unquoted-catalog-reference",
+                Expectation.MUST_PASS,
+                "SELECT COUNT(*) FROM exasol.PG_DEMO.ORDERS"));
 
             probes.add(simple("pgjdbc", "pg-settings-max-index-keys", Expectation.EXPLORATORY,
                 "SELECT setting FROM pg_catalog.pg_settings WHERE name='max_index_keys'"));

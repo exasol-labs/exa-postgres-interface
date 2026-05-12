@@ -83,6 +83,15 @@ static REGCLASS_LITERAL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static QUOTE_IDENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bquote_ident\s*\(\s*([^()]+?)\s*\)").unwrap());
+// Strips a leading "exasol" catalog qualifier from 3-part references so that
+// `["exasol".]schema.table` becomes `schema.table`. Each segment may be
+// independently quoted.
+static EXASOL_CATALOG_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(^|[\s,(\[])"?exasol"?\s*\.\s*("?[A-Za-z_][A-Za-z0-9_]*"?\s*\.\s*"?[A-Za-z_][A-Za-z0-9_]*"?)"#,
+    )
+    .unwrap()
+});
 
 const CATALOG_RELATIONS: &[&str] = &[
     "pg_aggregate",
@@ -253,6 +262,8 @@ const INFORMATION_SCHEMA_COLUMNS: &[&str] = &[
 ];
 
 pub fn translate_postgres_to_exasol(sql: &str) -> Result<String, TranslationError> {
+    let sql = strip_exasol_catalog_prefix(sql);
+    let sql = sql.as_str();
     if is_exasol_passthrough_sql(sql) {
         return Ok(sql.to_owned());
     }
@@ -901,6 +912,20 @@ fn rewrite_qualified_operators(sql: &str) -> String {
         .to_string()
 }
 
+fn strip_exasol_catalog_prefix(sql: &str) -> String {
+    // PostgreSQL clients (DBeaver, Qlik, etc.) often emit three-part
+    // `database.schema.table` references where the database segment is
+    // `exasol`. Exasol has no catalog tier, so the leading `exasol.` must be
+    // stripped before the SQL is sent on. Runs ahead of every other rewrite
+    // — including the passthrough check — so even otherwise Exasol-shaped SQL
+    // benefits.
+    EXASOL_CATALOG_PREFIX_RE
+        .replace_all(sql, |cap: &Captures| {
+            format!("{}{}", cap.get(1).map_or("", |m| m.as_str()), &cap[2])
+        })
+        .to_string()
+}
+
 fn rewrite_quote_ident(sql: &str) -> String {
     // Exasol has no quote_ident; emulate by always wrapping the argument in
     // double quotes and doubling any embedded double quotes. Matches the
@@ -1161,6 +1186,30 @@ WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
         assert!(!translated.to_ascii_lowercase().contains("quote_ident"));
         assert!(translated.contains("REPLACE($1"));
         assert!(translated.contains("'\"'"));
+    }
+
+    #[test]
+    fn strips_exasol_catalog_prefix_from_three_part_quoted_reference() {
+        let sql = "SELECT \"SHIPMENT_ID\" FROM \"exasol\".\"CORE_DB_2026_1_DEMOS\".\"SHIPMENTS\"";
+        let translated = translate_postgres_to_exasol(sql).unwrap();
+        assert!(!translated.contains("\"exasol\""));
+        assert!(translated.contains("\"CORE_DB_2026_1_DEMOS\".\"SHIPMENTS\""));
+    }
+
+    #[test]
+    fn strips_exasol_catalog_prefix_from_three_part_unquoted_reference() {
+        let translated =
+            translate_postgres_to_exasol("SELECT * FROM exasol.pg_demo.orders").unwrap();
+        assert!(!translated.to_ascii_lowercase().contains("exasol.pg_demo"));
+        assert!(translated.to_ascii_lowercase().contains("pg_demo.orders"));
+    }
+
+    #[test]
+    fn leaves_unrelated_three_part_reference_alone() {
+        // Reference whose first segment is not `exasol` must pass through.
+        let sql = "SELECT * FROM otherdb.pg_demo.orders";
+        let translated = translate_postgres_to_exasol(sql).unwrap();
+        assert!(translated.contains("otherdb.pg_demo.orders"));
     }
 
     #[test]
