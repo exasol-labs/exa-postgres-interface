@@ -768,10 +768,13 @@ public class PgJdbcCompatibilitySuite {
                 Collections.<String>emptyList()
             ));
 
-            // set-search-path-multi: multi-schema SET must be rejected with SQL error
-            probes.add(expectingFailure(
-                "session", "set-search-path-multi",
-                "SET search_path TO pg_demo, pg_catalog"
+            // set-search-path-multi: multi-schema SET silently opens only the
+            // first schema (Exasol has no equivalent of a search path list).
+            probes.add(withSetupAndCleanup(
+                "session", "set-search-path-multi", Expectation.MUST_PASS,
+                "SELECT current_schema()",
+                setup("SET search_path TO \"PG_DEMO\", pg_catalog"),
+                Collections.<String>emptyList()
             ));
 
             // reset-search-path: RESET search_path is a no-op (success)

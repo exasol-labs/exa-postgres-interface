@@ -122,12 +122,6 @@ pub fn classify_statement(sql: &str) -> StatementPlan {
         return match parse_search_path_value(rhs) {
             SearchPathTarget::Single(schema) => StatementPlan::SetSearchPath { schema },
             SearchPathTarget::Default => StatementPlan::ClientSet,
-            SearchPathTarget::Multi => StatementPlan::Reject {
-                sqlstate: "0A000",
-                message:
-                    "search_path supports only a single schema; multi-schema search paths are not supported"
-                        .to_owned(),
-            },
             SearchPathTarget::Invalid => StatementPlan::Reject {
                 sqlstate: "42601",
                 message: "invalid search_path value".to_owned(),
@@ -499,7 +493,6 @@ fn second_keyword(sql: &str) -> String {
 enum SearchPathTarget {
     Single(String),
     Default,
-    Multi,
     Invalid,
 }
 
@@ -509,11 +502,11 @@ fn parse_search_path_value(rhs: &str) -> SearchPathTarget {
         return SearchPathTarget::Invalid;
     }
 
-    // Detect a top-level comma (a comma not inside any quoted segment).
-    // We must consult the structure of the string to avoid false positives
-    // like `"a, b"` (one schema named `a, b`) and `'a, b'` (likewise).
-    if has_top_level_comma(trimmed) {
-        return SearchPathTarget::Multi;
+    // PostgreSQL allows a comma-separated list of schemas; Exasol's OPEN
+    // SCHEMA only takes one. Silently keep the first entry and drop the rest
+    // so client tools that emit `SET search_path = "a", "b"` still succeed.
+    if let Some(idx) = top_level_comma_index(trimmed) {
+        return parse_search_path_value(&trimmed[..idx]);
     }
 
     // Bare identifier `DEFAULT` (case-insensitive, unquoted) acts as a
@@ -543,33 +536,33 @@ fn parse_search_path_value(rhs: &str) -> SearchPathTarget {
     SearchPathTarget::Single(trimmed.to_owned())
 }
 
-fn has_top_level_comma(value: &str) -> bool {
+fn top_level_comma_index(value: &str) -> Option<usize> {
     let mut in_double = false;
     let mut in_single = false;
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let mut chars = value.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
         match ch {
             '"' if !in_single => {
                 // Handle `""` escape inside a double-quoted segment by
                 // consuming the second quote so we stay inside the segment.
-                if in_double && chars.peek() == Some(&'"') {
+                if in_double && chars.peek().map(|(_, c)| *c) == Some('"') {
                     chars.next();
                 } else {
                     in_double = !in_double;
                 }
             }
             '\'' if !in_double => {
-                if in_single && chars.peek() == Some(&'\'') {
+                if in_single && chars.peek().map(|(_, c)| *c) == Some('\'') {
                     chars.next();
                 } else {
                     in_single = !in_single;
                 }
             }
-            ',' if !in_double && !in_single => return true,
+            ',' if !in_double && !in_single => return Some(idx),
             _ => {}
         }
     }
-    false
+    None
 }
 
 fn strip_enclosing(value: &str, open: char, close: char) -> Option<&str> {
@@ -1029,11 +1022,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_set_search_path_multi_schema() {
-        assert!(matches!(
+    fn set_search_path_multi_schema_keeps_first_entry() {
+        // PostgreSQL clients commonly emit a list (e.g. `"DEMO","public"`).
+        // Exasol has no equivalent, so silently keep the first schema and
+        // drop the rest rather than rejecting the whole statement.
+        assert_eq!(
             classify_statement("SET search_path = pg_demo, pg_catalog"),
-            StatementPlan::Reject { message, .. } if message.contains("single schema")
-        ));
+            StatementPlan::SetSearchPath {
+                schema: "pg_demo".to_owned()
+            }
+        );
+        assert_eq!(
+            classify_statement(r#"SET search_path TO "DEMO_SANDBOX","public""#),
+            StatementPlan::SetSearchPath {
+                schema: "DEMO_SANDBOX".to_owned()
+            }
+        );
     }
 
     #[test]

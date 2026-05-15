@@ -690,9 +690,13 @@ WITH BASE AS (
       ON R.ROLNAME = SCHEMA_OWNER
     WHERE SCHEMA_NAME NOT IN ('SYS', 'PG_CATALOG', 'INFORMATION_SCHEMA')
     UNION ALL
-    SELECT CAST(11 AS DECIMAL(18,0)), 'PG_CATALOG', CAST(10 AS DECIMAL(18,0)), CAST(NULL AS VARCHAR(2000))
+    -- nspname for system schemas must be lowercase: PostgreSQL clients (e.g.
+    -- DBeaver) compare it case-sensitively against 'pg_catalog' to decide
+    -- whether to schema-qualify type names. Returning uppercase here causes
+    -- type displays like `"PG_CATALOG"."NUMERIC"(18)` instead of `numeric(18)`.
+    SELECT CAST(11 AS DECIMAL(18,0)), 'pg_catalog', CAST(10 AS DECIMAL(18,0)), CAST(NULL AS VARCHAR(2000))
     UNION ALL
-    SELECT CAST(12 AS DECIMAL(18,0)), 'INFORMATION_SCHEMA', CAST(10 AS DECIMAL(18,0)), CAST(NULL AS VARCHAR(2000))
+    SELECT CAST(12 AS DECIMAL(18,0)), 'information_schema', CAST(10 AS DECIMAL(18,0)), CAST(NULL AS VARCHAR(2000))
 )
 SELECT
     BASE."OID" AS "OID",

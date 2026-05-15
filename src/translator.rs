@@ -49,6 +49,8 @@ static CURRENT_CATALOG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bcurrent_catalog(?:\s*\(\s*\))?").unwrap());
 static CURRENT_SCHEMA_CALL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bcurrent_schema\s*\(\s*\)").unwrap());
+static SESSION_USER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bsession_user(?:\s*\(\s*\))?").unwrap());
 static CURRENT_SCHEMAS_FIRST_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\(?\s*(?:pg_catalog\.)?current_schemas\s*\(\s*true\s*\)\s*\)?\s*\[\s*1\s*\]")
         .unwrap()
@@ -296,6 +298,7 @@ fn is_exasol_passthrough_sql(sql: &str) -> bool {
         " operator(",
         " current_database(",
         " current_catalog",
+        " session_user",
         " current_schemas(",
         " current_schema(",
         " obj_description(",
@@ -764,8 +767,17 @@ fn rewrite_pg_catalog(sql: &str) -> String {
     sql = CURRENT_SCHEMA_CALL_RE
         .replace_all(&sql, "CURRENT_SCHEMA")
         .to_string();
+    // Exasol has no SESSION_USER keyword; the closest equivalent is
+    // CURRENT_USER (Exasol does not distinguish session-level vs current
+    // identity), so map all references through.
+    sql = SESSION_USER_RE
+        .replace_all(&sql, "CURRENT_USER")
+        .to_string();
+    // Lowercase to stay consistent with PG_CATALOG.PG_NAMESPACE.nspname,
+    // which now returns 'pg_catalog' so PostgreSQL clients recognise the
+    // system namespace case-sensitively.
     sql = CURRENT_SCHEMAS_FIRST_RE
-        .replace_all(&sql, "'PG_CATALOG'")
+        .replace_all(&sql, "'pg_catalog'")
         .to_string();
     sql = qualify_schema_prefix(&sql, "pg_catalog", "PG_CATALOG");
     sql = qualify_schema_prefix(&sql, "information_schema", "INFORMATION_SCHEMA");
@@ -1210,6 +1222,22 @@ WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
         let sql = "SELECT * FROM otherdb.pg_demo.orders";
         let translated = translate_postgres_to_exasol(sql).unwrap();
         assert!(translated.contains("otherdb.pg_demo.orders"));
+    }
+
+    #[test]
+    fn rewrites_session_user_to_current_user() {
+        // Exasol has no SESSION_USER keyword; PostgreSQL clients (notably
+        // DBeaver and pgJDBC) reach for it during connection setup. Map both
+        // the bare keyword and the parenthesised form.
+        let translated = translate_postgres_to_exasol("SELECT session_user").unwrap();
+        let upper = translated.to_ascii_uppercase();
+        assert!(upper.contains("CURRENT_USER"));
+        assert!(!upper.contains("SESSION_USER"));
+
+        let translated = translate_postgres_to_exasol("SELECT SESSION_USER()").unwrap();
+        let upper = translated.to_ascii_uppercase();
+        assert!(upper.contains("CURRENT_USER"));
+        assert!(!upper.contains("SESSION_USER"));
     }
 
     #[test]

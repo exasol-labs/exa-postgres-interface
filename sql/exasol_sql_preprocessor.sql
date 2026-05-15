@@ -541,7 +541,7 @@ def rewrite_pg_catalog(sql):
     )
     sql = CURRENT_DATABASE_RE.sub("'exasol'", sql)
     sql = CURRENT_CATALOG_RE.sub("'exasol'", sql)
-    sql = CURRENT_SCHEMAS_FIRST_RE.sub("'PG_CATALOG'", sql)
+    sql = CURRENT_SCHEMAS_FIRST_RE.sub("'pg_catalog'", sql)
     sql = QUALIFIED_PG_CATALOG_RE.sub("PG_CATALOG.", sql)
     sql = QUALIFIED_INFO_SCHEMA_RE.sub("INFORMATION_SCHEMA.", sql)
     sql = rewrite_catalog_relations(sql)
