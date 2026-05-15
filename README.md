@@ -4,7 +4,7 @@ A PostgreSQL wire-protocol gateway for Exasol. PostgreSQL-capable tools connect
 to the gateway; the gateway translates their SQL and metadata calls to Exasol
 and proxies the rest. Exasol remains the database engine.
 
-**Current release:** `v0.0.6` — see
+**Current release:** `v0.0.7` — see
 [Releases](https://github.com/nconforti93/exa-postgres-interface/releases).
 v0.0.6 adds gateway-side translation of `quote_ident()` and `current_schema()`
 (Metabase session bootstrap, JDBC `SET search_path` round-trip) and wires the
@@ -16,10 +16,10 @@ Download the Linux x86_64 release (built for `x86_64-unknown-linux-musl`, no
 glibc/OpenSSL dependency):
 
 ```bash
-curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.0.6/exa-postgres-interface-v0.0.6-linux-x86_64.tar.gz
-curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.0.6/exa-postgres-interface-v0.0.6-linux-x86_64.tar.gz.sha256
-sha256sum -c exa-postgres-interface-v0.0.6-linux-x86_64.tar.gz.sha256
-tar -xzf exa-postgres-interface-v0.0.6-linux-x86_64.tar.gz
+curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.0.7/exa-postgres-interface-v0.0.7-linux-x86_64.tar.gz
+curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.0.7/exa-postgres-interface-v0.0.7-linux-x86_64.tar.gz.sha256
+sha256sum -c exa-postgres-interface-v0.0.7-linux-x86_64.tar.gz.sha256
+tar -xzf exa-postgres-interface-v0.0.7-linux-x86_64.tar.gz
 ```
 
 The archive contains the gateway binary, the `exasol_exec` SQL helper,
@@ -33,18 +33,18 @@ the listener and Exasol connection settings, writes the TOML, and offers to
 install the catalog compatibility objects:
 
 ```bash
-exa-postgres-interface-v0.0.6-linux-x86_64/bin/exa-postgres-interface \
+exa-postgres-interface-v0.0.7-linux-x86_64/bin/exa-postgres-interface \
   --config config/local.toml
 ```
 
 ### Non-interactive catalog install
 
 ```bash
-exa-postgres-interface-v0.0.6-linux-x86_64/bin/exasol_exec \
+exa-postgres-interface-v0.0.7-linux-x86_64/bin/exasol_exec \
   --dsn EXASOL_HOST:8563 \
   --user sys \
   --password 'EXASOL_PASSWORD' \
-  --file exa-postgres-interface-v0.0.6-linux-x86_64/sql/postgres_catalog_compatibility.sql
+  --file exa-postgres-interface-v0.0.7-linux-x86_64/sql/postgres_catalog_compatibility.sql
 ```
 
 ### Configuration
@@ -74,9 +74,9 @@ full reference.
 ### systemd
 
 ```bash
-sudo install -m 0755 exa-postgres-interface-v0.0.6-linux-x86_64/bin/exa-postgres-interface /opt/exa-postgres-interface/bin/exa-postgres-interface
-sudo install -m 0640 -o root -g exa-postgres-interface exa-postgres-interface-v0.0.6-linux-x86_64/config/example.toml /etc/exa-postgres-interface/config.toml
-sudo install -m 0644 exa-postgres-interface-v0.0.6-linux-x86_64/packaging/exa-postgres-interface.service /etc/systemd/system/exa-postgres-interface.service
+sudo install -m 0755 exa-postgres-interface-v0.0.7-linux-x86_64/bin/exa-postgres-interface /opt/exa-postgres-interface/bin/exa-postgres-interface
+sudo install -m 0640 -o root -g exa-postgres-interface exa-postgres-interface-v0.0.7-linux-x86_64/config/example.toml /etc/exa-postgres-interface/config.toml
+sudo install -m 0644 exa-postgres-interface-v0.0.7-linux-x86_64/packaging/exa-postgres-interface.service /etc/systemd/system/exa-postgres-interface.service
 sudo systemctl daemon-reload && sudo systemctl enable --now exa-postgres-interface
 ```
 
