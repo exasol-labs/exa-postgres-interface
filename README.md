@@ -1,4 +1,4 @@
-# exa-postgres-interface
+# PostgreSQL Gateway for Exasol
 
 A PostgreSQL wire-protocol gateway for Exasol. PostgreSQL-capable tools connect
 to the gateway; the gateway translates their SQL and metadata calls to Exasol
