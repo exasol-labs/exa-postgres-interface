@@ -1,27 +1,20 @@
-mod bootstrap;
-mod config;
-mod exasol;
-mod metadata;
-mod pg_server;
-mod policy;
-mod translator;
-
 use std::fs::File;
 use std::io::{BufReader, Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bootstrap::{BootstrapMode, ensure_config_file, run_interactive_bootstrap};
+use exa_postgres_interface::bootstrap::{
+    BootstrapMode, ensure_config_file, run_interactive_bootstrap,
+};
+use exa_postgres_interface::config::AppConfig;
+use exa_postgres_interface::pg_server::{ExasolPgWireFactory, ExasolPgWireHandler};
 use rustls_pemfile::{certs, private_key};
 use rustls_pki_types::CertificateDer;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tracing::info;
-
-use crate::config::AppConfig;
-use crate::pg_server::{ExasolPgWireFactory, ExasolPgWireHandler};
 
 const TOKIO_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
@@ -34,6 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let args = parse_args()?;
     let config_path = ensure_config_file(args.config_path.clone())?;
 
@@ -43,7 +38,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     if matches!(args.bootstrap_mode, BootstrapMode::Interactive) {
-        run_interactive_bootstrap(&config, &config_path)?;
+        run_interactive_bootstrap(&config, &config_path).await?;
     }
 
     let listen_addr: SocketAddr = format!(

@@ -2,13 +2,17 @@
 
 The protocol server SHALL route PostgreSQL client statements through a documented capability policy instead of a read-only policy. Supported statements SHALL execute against Exasol or through explicit gateway-managed compatibility behavior, and unsupported statements SHALL fail clearly without leaving ambiguous session state.
 
+Exasol execution SHALL occur through the `exarrow-rs` async driver. Arrow `RecordBatch` results and Exasol-reported row counts SHALL be the only result shapes the gateway carries between transport and PostgreSQL response mapping.
+
 PostgreSQL wire compatibility remains a client integration layer. Exasol remains the database of record.
 
 ## Background
 
 * The client connects using a PostgreSQL-compatible client driver.
-* The protocol server opens one Exasol session per accepted client session.
+* The protocol server opens one Exasol session per accepted client session through the `exarrow-rs` driver.
 * PostgreSQL clients observe result rows, command completion tags, affected-row counts, errors, and transaction status.
+* Result-returning Exasol statements expose data as Apache Arrow `RecordBatch` values; row-modifying statements expose an Exasol row count.
+* The gateway-managed cursor registry holds materialised Arrow `RecordBatch` data, not pre-stringified rows.
 * Exasol supports core read and write SQL families, but not every PostgreSQL command or object model.
 * Some client-visible PostgreSQL behaviors, including SQL cursors, may need gateway-managed compatibility.
 * PostgreSQL clients use `SET search_path` and `SHOW search_path` to scope or inspect the active schema; Exasol exposes equivalent state through `OPEN SCHEMA` and `current_schema()`.
@@ -28,9 +32,9 @@ PostgreSQL wire compatibility remains a client integration layer. Exasol remains
 
 * *GIVEN* the compatibility matrix marks a PostgreSQL DML statement as supported
 * *WHEN* the user sends `INSERT`, `UPDATE`, `DELETE`, or `MERGE` syntax that can be translated to Exasol
-* *THEN* the server SHALL execute the translated statement against Exasol
-* *AND* the server SHALL return a PostgreSQL-compatible command completion response
-* *AND* the server SHOULD include an affected-row count when Exasol exposes a reliable count for that statement
+* *THEN* the server SHALL execute the translated statement against Exasol through `exarrow-rs`
+* *AND* the server SHALL read the affected-row count from the Exasol row-count result returned by the driver
+* *AND* the server SHALL return a PostgreSQL-compatible command completion response that carries the Exasol-reported row count when Exasol exposes one
 * *AND* the server SHALL document any case where the PostgreSQL command tag cannot represent Exasol behavior exactly
 
 
@@ -68,93 +72,3 @@ PostgreSQL wire compatibility remains a client integration layer. Exasol remains
 * *THEN* the server SHALL return a PostgreSQL-compatible error
 * *AND* the server SHALL log whether the failure occurred during policy classification, translation, Exasol execution, or protocol response mapping
 * *AND* the server SHALL make the resulting transaction/session state observable through ReadyForQuery status and logs
-
-
-### Scenario: SQL cursor declaration is gateway-managed
-
-* *GIVEN* the client has an active session through the protocol server
-* *WHEN* the user sends `DECLARE <name> CURSOR FOR <query>`
-* *THEN* the server SHOULD create a gateway-managed cursor when `<query>` is a supported row-returning query
-* *AND* the server SHALL store cursor metadata in per-session state
-* *AND* the server SHALL reject duplicate cursor names within the same session
-* *AND* the server SHALL reject cursor declarations whose query or options require unsupported PostgreSQL semantics
-
-
-### Scenario: SQL cursor fetch returns result rows
-
-* *GIVEN* a gateway-managed cursor exists for the client session
-* *WHEN* the user sends `FETCH` for that cursor
-* *THEN* the server SHALL return a PostgreSQL-compatible row description and data rows for the requested cursor slice
-* *AND* the server SHALL update the cursor position according to the supported fetch direction
-* *AND* the server SHALL return a `FETCH <count>` command completion tag
-
-
-### Scenario: SQL cursor movement and cleanup are explicit
-
-* *GIVEN* a gateway-managed cursor exists for the client session
-* *WHEN* the user sends `MOVE` or `CLOSE`
-* *THEN* `MOVE` SHOULD adjust the cursor position without returning rows when the requested movement is supported
-* *AND* `CLOSE` SHALL release gateway cursor state
-* *AND* the server SHALL release all non-hold cursor state at the documented transaction or session boundary
-
-
-### Scenario: Unsupported cursor semantics fail safely
-
-* *GIVEN* the client requests cursor behavior such as binary cursors, positioned updates, `WHERE CURRENT OF`, unsupported scroll direction, or unsupported holdability
-* *WHEN* the server cannot provide that behavior without changing material semantics
-* *THEN* the server SHALL reject the cursor command with a PostgreSQL-compatible error
-* *AND* the server SHALL NOT silently downgrade to a different cursor behavior
-
-
-### Scenario: Prepared statements and protocol portals are designed with write support
-
-* *GIVEN* a client uses PostgreSQL extended query messages or SQL `PREPARE` and `EXECUTE`
-* *WHEN* the prepared statement contains supported read or write SQL
-* *THEN* the server SHOULD preserve statement classification, parameter typing, translation, execution, and response mapping across parse, bind, execute, and sync phases
-* *AND* the server SHALL reject unsupported parameter modes or binary formats with a clear PostgreSQL-compatible error
-
-
-### Scenario: Single-schema search_path opens the Exasol schema
-
-* *GIVEN* the client has an active Exasol session through the protocol server
-* *WHEN* the client sends `SET search_path = <schema>` or `SET search_path TO <schema>` with exactly one schema identifier
-* *THEN* the server SHALL classify the statement as a gateway-managed search_path assignment
-* *AND* the server SHALL execute `OPEN SCHEMA <schema>` against Exasol using the active session
-* *AND* the server SHALL update gateway-managed session state so that the active schema reflects the new value
-* *AND* the server SHALL return a PostgreSQL-compatible `SET` command completion response
-
-
-### Scenario: Multi-schema search_path is rejected with a compatibility error
-
-* *GIVEN* the client has an active Exasol session through the protocol server
-* *WHEN* the client sends `SET search_path` with more than one comma-separated schema identifier
-* *THEN* the server SHALL reject the statement with a PostgreSQL-compatible error stating that only single-schema search paths are supported
-* *AND* the server SHALL NOT change gateway-managed session state or issue any `OPEN SCHEMA` against Exasol
-* *AND* the server SHALL keep the client session usable for subsequent statements
-
-
-### Scenario: search_path reset is a no-op
-
-* *GIVEN* the client has an active Exasol session through the protocol server
-* *WHEN* the client sends `RESET search_path`, `SET search_path = DEFAULT`, or `SET search_path TO DEFAULT`
-* *THEN* the server SHALL accept the statement and return a PostgreSQL-compatible command completion response
-* *AND* the server SHALL NOT issue any Exasol statement on behalf of the request
-* *AND* the server SHALL leave gateway-managed session state unchanged because Exasol has no documented "close schema" command
-
-
-### Scenario: SHOW search_path reflects the active schema
-
-* *GIVEN* the client has an active Exasol session through the protocol server
-* *WHEN* the client sends `SHOW search_path`
-* *THEN* the server SHALL return the gateway-tracked active schema when one has been set during the session
-* *AND* the server SHALL return the documented default value when no schema has been opened during the session
-* *AND* the response column name SHALL match the PostgreSQL `SHOW search_path` convention
-
-
-### Scenario: search_path open failure surfaces as a PostgreSQL-compatible error
-
-* *GIVEN* the client has an active Exasol session through the protocol server
-* *WHEN* the client sends `SET search_path = <schema>` and Exasol rejects the resulting `OPEN SCHEMA <schema>` statement
-* *THEN* the server SHALL return a PostgreSQL-compatible error that identifies the failure
-* *AND* the server SHALL NOT update gateway-managed session state
-* *AND* the server SHALL keep the client session usable for subsequent statements

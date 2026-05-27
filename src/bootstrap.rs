@@ -2,8 +2,12 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use arrow::array::{Array, RecordBatch, cast::AsArray};
+use arrow::datatypes::{DataType, Int64Type};
+use arrow::util::display::{ArrayFormatter, FormatOptions};
+
 use crate::config::AppConfig;
-use crate::exasol::{ExasolError, ExasolResult, ExasolSession};
+use crate::exasol::{ExasolError, ExasolOutcome, ExasolSession};
 
 const DEFAULT_CONFIG_PATH: &str = "config/local.toml";
 const CATALOG_SQL: &str = include_str!("../sql/postgres_catalog_compatibility.sql");
@@ -49,7 +53,7 @@ pub fn ensure_config_file(
     Ok(path)
 }
 
-pub fn run_interactive_bootstrap(
+pub async fn run_interactive_bootstrap(
     config: &AppConfig,
     config_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -72,16 +76,16 @@ pub fn run_interactive_bootstrap(
     let password = rpassword::prompt_password("Exasol setup password: ")?;
     let mut setup_config = config.exasol.clone();
     setup_config.pass_client_credentials = true;
-    let mut session = ExasolSession::connect(&setup_config, &username, &password)?;
+    let mut session = ExasolSession::connect(&setup_config, &username, &password).await?;
 
-    let schemas = installed_schema_count(&mut session)?;
+    let schemas = installed_schema_count(&mut session).await?;
     if schemas < 2 {
         println!("Missing PostgreSQL compatibility schemas.");
         if confirm(
             "Create or replace PG_CATALOG and INFORMATION_SCHEMA compatibility objects?",
             true,
         )? {
-            install_catalog(&mut session)?;
+            install_catalog(&mut session).await?;
         } else {
             println!("Skipped catalog installation.");
         }
@@ -89,11 +93,12 @@ pub fn run_interactive_bootstrap(
         "PG_CATALOG and INFORMATION_SCHEMA are present. Refresh compatibility objects?",
         false,
     )? {
-        install_catalog(&mut session)?;
+        install_catalog(&mut session).await?;
     }
 
     if !config.translation.sql_preprocessor_script.trim().is_empty() {
-        ensure_optional_preprocessor(&mut session, &config.translation.sql_preprocessor_script)?;
+        ensure_optional_preprocessor(&mut session, &config.translation.sql_preprocessor_script)
+            .await?;
     }
 
     print_systemd_guidance(config_path);
@@ -150,14 +155,14 @@ enabled = true
     ))
 }
 
-fn installed_schema_count(session: &mut ExasolSession) -> Result<usize, ExasolError> {
-    let result = session.execute(
+async fn installed_schema_count(session: &mut ExasolSession) -> Result<usize, ExasolError> {
+    let outcome = session.execute(
         "SELECT COUNT(*) FROM SYS.EXA_SCHEMAS WHERE SCHEMA_NAME IN ('PG_CATALOG', 'INFORMATION_SCHEMA')",
-    )?;
-    first_count(result)
+    ).await?;
+    first_count(outcome)
 }
 
-fn ensure_optional_preprocessor(
+async fn ensure_optional_preprocessor(
     session: &mut ExasolSession,
     configured_script: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -169,10 +174,10 @@ fn ensure_optional_preprocessor(
         return Ok(());
     }
 
-    let result = session.execute(
+    let outcome = session.execute(
         "SELECT COUNT(*) FROM SYS.EXA_ALL_SCRIPTS WHERE SCRIPT_SCHEMA = 'PG_CATALOG' AND SCRIPT_NAME = 'PG_SQL_PREPROCESSOR'",
-    )?;
-    if first_count(result)? == 1 {
+    ).await?;
+    if first_count(outcome)? == 1 {
         return Ok(());
     }
 
@@ -180,20 +185,23 @@ fn ensure_optional_preprocessor(
         "Optional PG_CATALOG.PG_SQL_PREPROCESSOR fallback is configured but missing. Install it now?",
         false,
     )? {
-        execute_exasol_script(session, PREPROCESSOR_SQL)?;
+        execute_exasol_script(session, PREPROCESSOR_SQL).await?;
         println!("Installed PG_CATALOG.PG_SQL_PREPROCESSOR.");
     }
     Ok(())
 }
 
-fn install_catalog(session: &mut ExasolSession) -> Result<(), ExasolError> {
+async fn install_catalog(session: &mut ExasolSession) -> Result<(), ExasolError> {
     println!("Installing PostgreSQL compatibility objects...");
-    execute_exasol_script(session, CATALOG_SQL)?;
+    execute_exasol_script(session, CATALOG_SQL).await?;
     println!("Installed PG_CATALOG and INFORMATION_SCHEMA compatibility objects.");
     Ok(())
 }
 
-fn execute_exasol_script(session: &mut ExasolSession, sql_text: &str) -> Result<(), ExasolError> {
+async fn execute_exasol_script(
+    session: &mut ExasolSession,
+    sql_text: &str,
+) -> Result<(), ExasolError> {
     let statements = split_exasol_sql(sql_text);
     for (idx, statement) in statements.iter().enumerate() {
         println!(
@@ -202,7 +210,7 @@ fn execute_exasol_script(session: &mut ExasolSession, sql_text: &str) -> Result<
             statements.len(),
             preview_statement(statement)
         );
-        session.execute(statement)?;
+        session.execute(statement).await?;
     }
     Ok(())
 }
@@ -278,17 +286,89 @@ fn preview_statement(sql: &str) -> String {
     preview
 }
 
-fn first_count(result: ExasolResult) -> Result<usize, ExasolError> {
-    let ExasolResult::ResultSet { rows, .. } = result else {
-        return Err(ExasolError::Execution(
-            "schema check returned row count instead of result set".to_owned(),
-        ));
+fn first_count(outcome: ExasolOutcome) -> Result<usize, ExasolError> {
+    let value = match outcome {
+        // Arrow transport: COUNT(*) comes back as record batches.
+        ExasolOutcome::ArrowRows(batches) => {
+            let batch = batches.first().ok_or_else(|| {
+                ExasolError::Execution("schema check returned no result batches".to_owned())
+            })?;
+            read_first_scalar_as_i64(batch)?
+        }
+        // WebSocket transport: the same query comes back as typed string rows.
+        ExasolOutcome::TypedRows { columns, rows } => {
+            if columns.is_empty() {
+                return Err(ExasolError::Execution(
+                    "schema check result set had no columns".to_owned(),
+                ));
+            }
+            let cell = rows
+                .first()
+                .and_then(|row| row.first())
+                .ok_or_else(|| {
+                    ExasolError::Execution("schema check result set was empty".to_owned())
+                })?;
+            let rendered = cell.as_ref().ok_or_else(|| {
+                ExasolError::Execution("schema check returned a NULL count".to_owned())
+            })?;
+            parse_count_string(rendered)?
+        }
+        ExasolOutcome::RowCount(_) => {
+            return Err(ExasolError::Execution(
+                "schema check returned row count instead of result set".to_owned(),
+            ));
+        }
     };
-    rows.first()
-        .and_then(|row| row.first())
-        .and_then(|value| value.as_deref())
-        .and_then(|value| value.parse::<usize>().ok())
-        .ok_or_else(|| ExasolError::Execution("schema check returned no count".to_owned()))
+
+    usize::try_from(value).map_err(|_| {
+        ExasolError::Execution(format!(
+            "schema check returned negative count value: {value}"
+        ))
+    })
+}
+
+fn read_first_scalar_as_i64(batch: &RecordBatch) -> Result<i64, ExasolError> {
+    if batch.num_rows() == 0 {
+        return Err(ExasolError::Execution(
+            "schema check result set was empty".to_owned(),
+        ));
+    }
+    let column = batch.columns().first().ok_or_else(|| {
+        ExasolError::Execution("schema check result set had no columns".to_owned())
+    })?;
+    if column.is_null(0) {
+        return Err(ExasolError::Execution(
+            "schema check returned a NULL count".to_owned(),
+        ));
+    }
+
+    if matches!(column.data_type(), DataType::Int64) {
+        return Ok(column.as_primitive::<Int64Type>().value(0));
+    }
+
+    let rendered = render_first_cell(column.as_ref())?;
+    parse_count_string(&rendered)
+}
+
+fn render_first_cell(array: &dyn Array) -> Result<String, ExasolError> {
+    let options = FormatOptions::new().with_display_error(false);
+    let formatter = ArrayFormatter::try_new(array, &options).map_err(|err| {
+        ExasolError::Execution(format!("cannot format schema check column: {err}"))
+    })?;
+    formatter
+        .value(0)
+        .try_to_string()
+        .map_err(|err| ExasolError::Execution(format!("cannot render schema check value: {err}")))
+}
+
+fn parse_count_string(rendered: &str) -> Result<i64, ExasolError> {
+    let trimmed = rendered.trim();
+    let integer_part = trimmed.split_once('.').map_or(trimmed, |(head, _)| head);
+    integer_part.parse::<i64>().map_err(|err| {
+        ExasolError::Execution(format!(
+            "cannot parse schema check value {rendered:?} as integer: {err}"
+        ))
+    })
 }
 
 fn prompt_required(label: &str) -> io::Result<String> {
@@ -360,7 +440,143 @@ fn toml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CATALOG_SQL, split_exasol_sql};
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{Field, Schema};
+
+    use crate::exasol::{ExasolColumn, ExasolError, ExasolOutcome};
+
+    use super::{CATALOG_SQL, first_count, split_exasol_sql};
+
+    fn batch(name: &str, column: ArrayRef) -> RecordBatch {
+        let field = Field::new(name, column.data_type().clone(), true);
+        let schema = Arc::new(Schema::new(vec![field]));
+        RecordBatch::try_new(schema, vec![column]).unwrap()
+    }
+
+    fn typed_rows(rows: Vec<Vec<Option<String>>>) -> ExasolOutcome {
+        ExasolOutcome::TypedRows {
+            columns: vec![ExasolColumn {
+                name: "c".to_owned(),
+                data_type: serde_json::Value::Null,
+            }],
+            rows,
+        }
+    }
+
+    #[test]
+    fn first_count_reads_int64_value() {
+        let column = Arc::new(Int64Array::from(vec![7_i64])) as ArrayRef;
+        let outcome = ExasolOutcome::ArrowRows(vec![batch("c", column)]);
+
+        assert_eq!(first_count(outcome).unwrap(), 7);
+    }
+
+    #[test]
+    fn first_count_reads_decimal128_value() {
+        let array = Decimal128Array::from(vec![42_i128])
+            .with_precision_and_scale(18, 0)
+            .unwrap();
+        let column = Arc::new(array) as ArrayRef;
+        let outcome = ExasolOutcome::ArrowRows(vec![batch("c", column)]);
+
+        assert_eq!(first_count(outcome).unwrap(), 42);
+    }
+
+    #[test]
+    fn first_count_reads_decimal128_with_scale_by_truncating_fraction() {
+        let array = Decimal128Array::from(vec![1230_i128])
+            .with_precision_and_scale(5, 1)
+            .unwrap();
+        let column = Arc::new(array) as ArrayRef;
+        let outcome = ExasolOutcome::ArrowRows(vec![batch("c", column)]);
+
+        assert_eq!(first_count(outcome).unwrap(), 123);
+    }
+
+    #[test]
+    fn first_count_parses_string_column() {
+        let column = Arc::new(StringArray::from(vec!["9"])) as ArrayRef;
+        let outcome = ExasolOutcome::ArrowRows(vec![batch("c", column)]);
+
+        assert_eq!(first_count(outcome).unwrap(), 9);
+    }
+
+    #[test]
+    fn first_count_reads_typed_rows_from_websocket() {
+        let outcome = typed_rows(vec![vec![Some("2".to_owned())]]);
+
+        assert_eq!(first_count(outcome).unwrap(), 2);
+    }
+
+    #[test]
+    fn first_count_rejects_empty_typed_rows() {
+        let outcome = typed_rows(Vec::new());
+
+        let err = first_count(outcome).unwrap_err();
+        assert!(matches!(err, ExasolError::Execution(_)));
+    }
+
+    #[test]
+    fn first_count_rejects_null_typed_count() {
+        let outcome = typed_rows(vec![vec![None]]);
+
+        let err = first_count(outcome).unwrap_err();
+        assert!(matches!(err, ExasolError::Execution(_)));
+    }
+
+    #[test]
+    fn first_count_rejects_row_count_outcome() {
+        let outcome = ExasolOutcome::RowCount(5);
+
+        let err = first_count(outcome).unwrap_err();
+        assert!(matches!(err, ExasolError::Execution(_)));
+    }
+
+    #[test]
+    fn first_count_rejects_empty_batches() {
+        let outcome = ExasolOutcome::ArrowRows(Vec::new());
+
+        let err = first_count(outcome).unwrap_err();
+        assert!(matches!(err, ExasolError::Execution(_)));
+    }
+
+    #[test]
+    fn first_count_rejects_empty_first_batch() {
+        let column = Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef;
+        let outcome = ExasolOutcome::ArrowRows(vec![batch("c", column)]);
+
+        let err = first_count(outcome).unwrap_err();
+        assert!(matches!(err, ExasolError::Execution(_)));
+    }
+
+    #[test]
+    fn first_count_rejects_null_first_value() {
+        let column = Arc::new(Int64Array::from(vec![None as Option<i64>])) as ArrayRef;
+        let outcome = ExasolOutcome::ArrowRows(vec![batch("c", column)]);
+
+        let err = first_count(outcome).unwrap_err();
+        assert!(matches!(err, ExasolError::Execution(_)));
+    }
+
+    #[test]
+    fn first_count_rejects_negative_value() {
+        let column = Arc::new(Int64Array::from(vec![-1_i64])) as ArrayRef;
+        let outcome = ExasolOutcome::ArrowRows(vec![batch("c", column)]);
+
+        let err = first_count(outcome).unwrap_err();
+        assert!(matches!(err, ExasolError::Execution(_)));
+    }
+
+    #[test]
+    fn first_count_rejects_unparseable_string() {
+        let column = Arc::new(StringArray::from(vec!["not-a-number"])) as ArrayRef;
+        let outcome = ExasolOutcome::ArrowRows(vec![batch("c", column)]);
+
+        let err = first_count(outcome).unwrap_err();
+        assert!(matches!(err, ExasolError::Execution(_)));
+    }
 
     #[test]
     fn splits_semicolon_and_slash_terminated_statements() {

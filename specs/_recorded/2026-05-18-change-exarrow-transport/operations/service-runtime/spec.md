@@ -1,16 +1,5 @@
 # Feature: Service Runtime
 
-Status as of 2026-04-27: implemented as a Linux binary plus TOML config and
-systemd unit template. Current deployment guidance installs the binary under
-`/opt/exa-postgres-interface/bin` and config under
-`/etc/exa-postgres-interface/config.toml`.
-
-Future target scope note: this feature spec describes the implemented runtime
-baseline. The follow-up read/write compatibility plan now targets a simpler
-administration model where PostgreSQL-to-Exasol dialect translation moves into
-the gateway and Exasol-side SQL preprocessing becomes optional fallback rather
-than mandatory setup.
-
 The prototype SHOULD be installable as a long-running server process on Linux. The preferred operating model is a binary managed by systemd with external configuration and observable logs.
 
 The runtime SHALL connect to Exasol through the `exarrow-rs` async driver. TLS, certificate fingerprint validation, and the `NOCERTCHECK` escape hatch SHALL be configurable on the same surface the gateway has historically exposed.
@@ -25,15 +14,7 @@ The runtime SHALL connect to Exasol through the `exarrow-rs` async driver. TLS, 
 
 ## Scenarios
 
-### Scenario: Operator starts the protocol server as a binary
-
-* *GIVEN* the application has been built for the target Linux environment
-* *WHEN* the operator starts the server binary with a valid configuration
-* *THEN* the server SHALL listen on the configured PostgreSQL protocol address and port
-* *AND* the server SHALL log startup configuration details that are safe to expose
-* *AND* the server SHALL NOT log plaintext passwords or secrets
-
-
+<!-- DELTA:CHANGED -->
 ### Scenario: Operator configures Exasol connectivity
 
 * *GIVEN* the operator provides server configuration
@@ -43,16 +24,9 @@ The runtime SHALL connect to Exasol through the `exarrow-rs` async driver. TLS, 
 * *AND* the configuration SHALL identify any required SQL translation mechanism, including whether translation is gateway-owned or uses an explicitly enabled Exasol-side preprocessor fallback
 * *AND* the configuration SHALL accept the existing `encryption`, `certificate_fingerprint`, and `validate_certificate` fields and apply them to the `exarrow-rs` connection parameters
 
+<!-- /DELTA:CHANGED -->
 
-### Scenario: Operator runs the protocol server through systemd
-
-* *GIVEN* the server binary and configuration have been installed on a Linux host
-* *WHEN* the operator enables and starts the provided systemd service
-* *THEN* systemd SHOULD manage the server process lifecycle
-* *AND* service logs SHOULD be available through standard Linux service logging tools
-* *AND* the service definition SHALL keep deployment-specific secrets outside the repository
-
-
+<!-- DELTA:NEW -->
 ### Scenario: Operator pins the Exasol certificate by SHA-256 fingerprint
 
 * *GIVEN* the operator sets `exasol.certificate_fingerprint` to the SHA-256 hex digest of the Exasol server certificate's DER encoding
@@ -62,7 +36,9 @@ The runtime SHALL connect to Exasol through the `exarrow-rs` async driver. TLS, 
 * *AND* the gateway SHALL refuse the connection with a clear configuration-level error when the presented certificate does not match the fingerprint
 * *AND* the gateway SHALL accept fingerprints supplied in upper- or lower-case hexadecimal
 
+<!-- /DELTA:NEW -->
 
+<!-- DELTA:NEW -->
 ### Scenario: Operator disables Exasol certificate validation
 
 * *GIVEN* the operator sets `exasol.validate_certificate` to `false`
@@ -72,7 +48,9 @@ The runtime SHALL connect to Exasol through the `exarrow-rs` async driver. TLS, 
 * *AND* the gateway SHALL log that certificate validation is disabled for the configured Exasol endpoint
 * *AND* the gateway MUST NOT silently disable certificate validation when neither escape hatch is configured
 
+<!-- /DELTA:NEW -->
 
+<!-- DELTA:NEW -->
 ### Scenario: Operator parses a fingerprint embedded in the Exasol DSN
 
 * *GIVEN* the operator supplies `exasol.dsn = "host/<sha256-hex>:port"` and leaves `exasol.certificate_fingerprint` empty
@@ -80,3 +58,5 @@ The runtime SHALL connect to Exasol through the `exarrow-rs` async driver. TLS, 
 * *THEN* the gateway SHALL extract the fingerprint segment from the DSN and pass it to the `exarrow-rs` connection parameters
 * *AND* the gateway SHALL pass only the host and port (without the fingerprint suffix) as the Exasol endpoint
 * *AND* the gateway SHALL prefer `exasol.certificate_fingerprint` over the DSN-embedded fingerprint when both are present
+
+<!-- /DELTA:NEW -->

@@ -665,10 +665,6 @@ fn catalog_pg_settings(sql: &str) -> StatementPlan {
     )
 }
 
-fn catalog_response(sql: &str, row: &[(&str, &str)]) -> StatementPlan {
-    catalog_response_many(sql, &[row.to_vec()])
-}
-
 fn catalog_response_many(sql: &str, source_rows: &[Vec<(&str, &str)>]) -> StatementPlan {
     let lower = sql.to_ascii_lowercase();
     if lower.contains("count(") {
@@ -809,9 +805,7 @@ fn source_column_name(expr: &str) -> String {
         "nspname".to_owned()
     } else if last.contains("rolname") {
         "rolname".to_owned()
-    } else if last.contains("current_database") {
-        "datname".to_owned()
-    } else if last.contains("current_catalog") {
+    } else if last.contains("current_database") || last.contains("current_catalog") {
         "datname".to_owned()
     } else {
         last

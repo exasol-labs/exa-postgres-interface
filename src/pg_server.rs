@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use arrow::array::{Array, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 use async_trait::async_trait;
 use byteorder::ReadBytesExt;
 use futures::{Sink, SinkExt, StreamExt, stream};
@@ -24,15 +27,16 @@ use pgwire::api::{
     PgWireServerHandlers, PidSecretKeyGenerator, RandomPidSecretKeyGenerator, Type,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::data::DataRow;
 use pgwire::messages::extendedquery::Execute;
 use pgwire::messages::response::EmptyQueryResponse;
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
-use tokio::task;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::config::AppConfig;
-use crate::exasol::{ExasolColumn, ExasolError, ExasolResult, ExasolSession};
+use crate::exasol::{ExasolColumn, ExasolError, ExasolOutcome, ExasolSession};
 use crate::metadata::{MetadataPlan, detect as detect_metadata, map_exasol_column_type};
 use crate::policy::{
     CursorClose, CursorDeclare, CursorDirection, CursorPlan, CursorPosition, RowCountPolicy,
@@ -54,8 +58,13 @@ enum GatewayResponse {
         columns: Vec<String>,
         rows: Vec<Vec<Option<String>>>,
     },
+    ArrowQuery {
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        command_tag: Option<String>,
+    },
     TypedQuery {
-        columns: Vec<GatewayColumn>,
+        columns: Vec<ExasolColumn>,
         rows: Vec<Vec<Option<String>>>,
         command_tag: Option<String>,
     },
@@ -76,24 +85,52 @@ enum GatewayResponse {
 }
 
 #[derive(Clone, Debug)]
-struct GatewayColumn {
-    name: String,
-    data_type: Type,
+enum CursorData {
+    Arrow {
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    },
+    Typed {
+        columns: Vec<ExasolColumn>,
+        rows: Vec<Vec<Option<String>>>,
+    },
 }
 
 #[derive(Clone, Debug)]
 struct GatewayCursor {
-    columns: Vec<GatewayColumn>,
-    rows: Vec<Vec<Option<String>>>,
+    data: CursorData,
     position: isize,
     scroll: bool,
     hold: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct CursorStep {
-    rows: Vec<Vec<Option<String>>>,
+    rows: CursorStepRows,
     count: usize,
+}
+
+#[derive(Debug)]
+enum CursorStepRows {
+    Arrow { batches: Vec<RecordBatch> },
+    Typed { rows: Vec<Vec<Option<String>>> },
+}
+
+impl CursorStepRows {
+    fn empty_like(data: &CursorData) -> Self {
+        match data {
+            CursorData::Arrow { .. } => CursorStepRows::Arrow {
+                batches: Vec::new(),
+            },
+            CursorData::Typed { .. } => CursorStepRows::Typed { rows: Vec::new() },
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CursorMetadata {
+    Arrow { schema: SchemaRef },
+    Typed { columns: Vec<ExasolColumn> },
 }
 
 pub struct ExasolPgWireHandler {
@@ -124,25 +161,24 @@ impl ExasolPgWireHandler {
         password: String,
     ) -> PgWireResult<SessionState> {
         let config = self.config.clone();
-        task::spawn_blocking(move || {
-            let mut session = ExasolSession::connect(&config.exasol, &username, &password)?;
-            if config.translation.enabled && !config.translation.sql_preprocessor_script.is_empty()
-            {
-                session.initialize(
+        let mut session = ExasolSession::connect(&config.exasol, &username, &password)
+            .await
+            .map_err(map_exasol_connection_error)?;
+        if config.translation.enabled && !config.translation.sql_preprocessor_script.is_empty() {
+            session
+                .initialize(
                     &config.translation.session_init_sql,
                     &config.translation.sql_preprocessor_script,
-                )?;
-            }
-            Ok::<_, ExasolError>(SessionState {
-                exasol: Mutex::new(session),
-                extended_results: Mutex::new(HashMap::new()),
-                cursors: Mutex::new(HashMap::new()),
-                current_schema: Mutex::new(None),
-            })
+                )
+                .await
+                .map_err(map_exasol_connection_error)?;
+        }
+        Ok(SessionState {
+            exasol: Mutex::new(session),
+            extended_results: Mutex::new(HashMap::new()),
+            cursors: Mutex::new(HashMap::new()),
+            current_schema: Mutex::new(None),
         })
-        .await
-        .map_err(|err| pg_error("58000", format!("Exasol connection task failed: {err}")))?
-        .map_err(map_exasol_connection_error)
     }
 
     async fn execute_sql<C>(&self, client: &mut C, sql: &str) -> PgWireResult<Vec<Response>>
@@ -171,6 +207,9 @@ impl ExasolPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         debug!(sql = %sql, "handling PostgreSQL statement");
+        if let Some(metadata_response) = self.execute_metadata_query(client, sql).await? {
+            return Ok(vec![metadata_response]);
+        }
         match classify_statement(sql) {
             StatementPlan::Empty => Ok(vec![GatewayResponse::Empty]),
             StatementPlan::ClientSet => Ok(vec![GatewayResponse::Execution {
@@ -184,23 +223,16 @@ impl ExasolPgWireHandler {
                     .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
                 let escaped = schema.replace('"', "\"\"");
                 let open_sql = format!("OPEN SCHEMA \"{escaped}\"");
-                let state_clone = state.clone();
-                let result = task::spawn_blocking(move || {
-                    let mut session = state_clone.exasol.lock().map_err(|_| {
-                        ExasolError::Connection("Exasol session lock poisoned".to_owned())
-                    })?;
-                    session.execute(&open_sql)
-                })
-                .await
-                .map_err(|err| pg_error("58000", format!("Exasol execution task failed: {err}")))?
-                .map_err(map_exasol_execution_error);
+                let result = {
+                    let mut session = state.exasol.lock().await;
+                    session
+                        .execute(&open_sql)
+                        .await
+                        .map_err(map_exasol_execution_error)
+                };
                 match result {
                     Ok(_) => {
-                        *state
-                            .current_schema
-                            .lock()
-                            .map_err(|_| pg_error("58000", "session schema lock poisoned"))? =
-                            Some(schema);
+                        *state.current_schema.lock().await = Some(schema);
                         Ok(vec![GatewayResponse::Execution {
                             command: "SET".to_owned(),
                             rows: None,
@@ -217,7 +249,7 @@ impl ExasolPgWireHandler {
                 let value = state
                     .current_schema
                     .lock()
-                    .map_err(|_| pg_error("58000", "session schema lock poisoned"))?
+                    .await
                     .clone()
                     .unwrap_or_else(|| "public".to_owned());
                 Ok(vec![GatewayResponse::Query {
@@ -229,7 +261,7 @@ impl ExasolPgWireHandler {
                 command: "BEGIN".to_owned(),
             }]),
             StatementPlan::ClientTransactionEnd { command } => {
-                clear_non_hold_cursors(client)?;
+                clear_non_hold_cursors(client).await?;
                 Ok(vec![GatewayResponse::TransactionEnd {
                     command: command.to_owned(),
                 }])
@@ -255,16 +287,14 @@ impl ExasolPgWireHandler {
                     .get::<SessionState>()
                     .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
                 let sql = self.translate_client_sql(sql)?;
-                let result = task::spawn_blocking(move || {
-                    let mut session = state.exasol.lock().map_err(|_| {
-                        ExasolError::Connection("Exasol session lock poisoned".to_owned())
-                    })?;
-                    session.execute(&sql)
-                })
-                .await
-                .map_err(|err| pg_error("58000", format!("Exasol execution task failed: {err}")))?
-                .map_err(map_exasol_execution_error)?;
-                map_exasol_result(result, command, row_count)
+                let outcome = {
+                    let mut session = state.exasol.lock().await;
+                    session
+                        .execute(&sql)
+                        .await
+                        .map_err(map_exasol_execution_error)?
+                };
+                map_exasol_result(outcome, command, row_count)
             }
         }
     }
@@ -282,9 +312,9 @@ impl ExasolPgWireHandler {
     {
         match plan {
             CursorPlan::Declare(declare) => self.declare_cursor(client, declare).await,
-            CursorPlan::Fetch(position) => self.fetch_cursor(client, position),
-            CursorPlan::Move(position) => self.move_cursor(client, position),
-            CursorPlan::Close(close) => self.close_cursor(client, close),
+            CursorPlan::Fetch(position) => self.fetch_cursor(client, position).await,
+            CursorPlan::Move(position) => self.move_cursor(client, position).await,
+            CursorPlan::Close(close) => self.close_cursor(client, close).await,
         }
     }
 
@@ -311,10 +341,7 @@ impl ExasolPgWireHandler {
                 .session_extensions()
                 .get::<SessionState>()
                 .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
-            let cursors = state
-                .cursors
-                .lock()
-                .map_err(|_| pg_error("58000", "cursor registry lock poisoned"))?;
+            let cursors = state.cursors.lock().await;
             if cursors.contains_key(&declare.name) {
                 return Ok(vec![GatewayResponse::Error {
                     sqlstate: "42P03".to_owned(),
@@ -323,16 +350,22 @@ impl ExasolPgWireHandler {
             }
         }
 
-        let result = self.execute_client_sql(client, &declare.query).await?;
-        let ExasolResult::ResultSet { columns, rows } = result else {
-            return Ok(vec![GatewayResponse::Error {
-                sqlstate: "0A000".to_owned(),
-                message: "cursor query must return rows".to_owned(),
-            }]);
+        let outcome = self.execute_client_sql(client, &declare.query).await?;
+        let data = match outcome {
+            ExasolOutcome::ArrowRows(batches) => {
+                let schema = cursor_schema_for(&batches);
+                CursorData::Arrow { schema, batches }
+            }
+            ExasolOutcome::TypedRows { columns, rows } => CursorData::Typed { columns, rows },
+            ExasolOutcome::RowCount(_) => {
+                return Ok(vec![GatewayResponse::Error {
+                    sqlstate: "0A000".to_owned(),
+                    message: "cursor query must return rows".to_owned(),
+                }]);
+            }
         };
         let cursor = GatewayCursor {
-            columns: map_exasol_columns(columns),
-            rows,
+            data,
             position: -1,
             scroll: declare.scroll,
             hold: declare.hold,
@@ -341,10 +374,7 @@ impl ExasolPgWireHandler {
             .session_extensions()
             .get::<SessionState>()
             .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
-        let mut cursors = state
-            .cursors
-            .lock()
-            .map_err(|_| pg_error("58000", "cursor registry lock poisoned"))?;
+        let mut cursors = state.cursors.lock().await;
         if cursors.contains_key(&declare.name) {
             return Ok(vec![GatewayResponse::Error {
                 sqlstate: "42P03".to_owned(),
@@ -358,7 +388,7 @@ impl ExasolPgWireHandler {
         }])
     }
 
-    fn fetch_cursor<C>(
+    async fn fetch_cursor<C>(
         &self,
         client: &C,
         position: CursorPosition,
@@ -370,26 +400,41 @@ impl ExasolPgWireHandler {
             .session_extensions()
             .get::<SessionState>()
             .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
-        let mut cursors = state
-            .cursors
-            .lock()
-            .map_err(|_| pg_error("58000", "cursor registry lock poisoned"))?;
+        let mut cursors = state.cursors.lock().await;
         let Some(cursor) = cursors.get_mut(&position.name) else {
             return Ok(vec![GatewayResponse::Error {
                 sqlstate: "34000".to_owned(),
                 message: format!("cursor \"{}\" does not exist", position.name),
             }]);
         };
-        let columns = cursor.columns.clone();
+        let metadata = cursor.metadata();
         let step = cursor.apply(position.direction, true)?;
-        Ok(vec![GatewayResponse::TypedQuery {
-            columns,
-            rows: step.rows,
-            command_tag: Some("FETCH".to_owned()),
-        }])
+        let response = match (metadata, step.rows) {
+            (CursorMetadata::Arrow { schema }, CursorStepRows::Arrow { batches }) => {
+                GatewayResponse::ArrowQuery {
+                    schema,
+                    batches,
+                    command_tag: Some("FETCH".to_owned()),
+                }
+            }
+            (CursorMetadata::Typed { columns }, CursorStepRows::Typed { rows }) => {
+                GatewayResponse::TypedQuery {
+                    columns,
+                    rows,
+                    command_tag: Some("FETCH".to_owned()),
+                }
+            }
+            _ => {
+                return Err(pg_error(
+                    "XX000",
+                    "cursor data and step variant mismatch (internal invariant violation)",
+                ));
+            }
+        };
+        Ok(vec![response])
     }
 
-    fn move_cursor<C>(
+    async fn move_cursor<C>(
         &self,
         client: &C,
         position: CursorPosition,
@@ -401,10 +446,7 @@ impl ExasolPgWireHandler {
             .session_extensions()
             .get::<SessionState>()
             .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
-        let mut cursors = state
-            .cursors
-            .lock()
-            .map_err(|_| pg_error("58000", "cursor registry lock poisoned"))?;
+        let mut cursors = state.cursors.lock().await;
         let Some(cursor) = cursors.get_mut(&position.name) else {
             return Ok(vec![GatewayResponse::Error {
                 sqlstate: "34000".to_owned(),
@@ -418,7 +460,11 @@ impl ExasolPgWireHandler {
         }])
     }
 
-    fn close_cursor<C>(&self, client: &C, close: CursorClose) -> PgWireResult<Vec<GatewayResponse>>
+    async fn close_cursor<C>(
+        &self,
+        client: &C,
+        close: CursorClose,
+    ) -> PgWireResult<Vec<GatewayResponse>>
     where
         C: ClientInfo,
     {
@@ -426,10 +472,7 @@ impl ExasolPgWireHandler {
             .session_extensions()
             .get::<SessionState>()
             .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
-        let mut cursors = state
-            .cursors
-            .lock()
-            .map_err(|_| pg_error("58000", "cursor registry lock poisoned"))?;
+        let mut cursors = state.cursors.lock().await;
         match close {
             CursorClose::All => cursors.clear(),
             CursorClose::One(name) => {
@@ -766,8 +809,8 @@ impl ExasolPgWireHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let result = self.execute_exasol_sql(client, sql).await?;
-        let mut responses = map_exasol_result(result, "SELECT", RowCountPolicy::Omit)?;
+        let outcome = self.execute_exasol_sql(client, sql).await?;
+        let mut responses = map_exasol_result(outcome, "SELECT", RowCountPolicy::Omit)?;
         Ok(responses.pop().unwrap_or(GatewayResponse::Empty))
     }
 
@@ -783,15 +826,16 @@ impl ExasolPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         match self.execute_exasol_sql(client, sql).await? {
-            ExasolResult::ResultSet { rows, .. } => Ok(rows),
-            ExasolResult::RowCount(_) => Err(pg_error(
+            ExasolOutcome::ArrowRows(batches) => Ok(arrow_batches_to_text_rows(&batches)),
+            ExasolOutcome::TypedRows { rows, .. } => Ok(rows),
+            ExasolOutcome::RowCount(_) => Err(pg_error(
                 "XX000",
                 "metadata query unexpectedly returned a row count",
             )),
         }
     }
 
-    async fn execute_exasol_sql<C>(&self, client: &mut C, sql: &str) -> PgWireResult<ExasolResult>
+    async fn execute_exasol_sql<C>(&self, client: &mut C, sql: &str) -> PgWireResult<ExasolOutcome>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
@@ -802,20 +846,14 @@ impl ExasolPgWireHandler {
             .session_extensions()
             .get::<SessionState>()
             .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
-        let sql = sql.to_owned();
-        task::spawn_blocking(move || {
-            let mut session = state
-                .exasol
-                .lock()
-                .map_err(|_| ExasolError::Connection("Exasol session lock poisoned".to_owned()))?;
-            session.execute(&sql)
-        })
-        .await
-        .map_err(|err| pg_error("58000", format!("Exasol execution task failed: {err}")))?
-        .map_err(map_exasol_execution_error)
+        let mut session = state.exasol.lock().await;
+        session
+            .execute(sql)
+            .await
+            .map_err(map_exasol_execution_error)
     }
 
-    async fn execute_client_sql<C>(&self, client: &mut C, sql: &str) -> PgWireResult<ExasolResult>
+    async fn execute_client_sql<C>(&self, client: &mut C, sql: &str) -> PgWireResult<ExasolOutcome>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
@@ -1091,7 +1129,7 @@ impl ExtendedQueryHandler for ExasolPgWireHandler {
             .ok_or_else(|| PgWireError::PortalNotFound(portal_name.to_owned()))?;
 
         client.set_state(PgWireConnectionState::QueryInProgress);
-        let cached_response = take_cached_extended_result(client, portal_name)?;
+        let cached_response = take_cached_extended_result(client, portal_name).await?;
         let was_described = cached_response.is_some();
         let response = if let Some(response) = cached_response {
             Response::try_from(response)?
@@ -1171,7 +1209,7 @@ impl ExtendedQueryHandler for ExasolPgWireHandler {
         let mut responses = self.execute_statement(client, &sql).await?;
         let response = responses.pop().unwrap_or(GatewayResponse::Empty);
         let fields = response.fields();
-        cache_extended_result(client, &target.name, response)?;
+        cache_extended_result(client, &target.name, response).await?;
         Ok(DescribePortalResponse::new(fields))
     }
 
@@ -1253,47 +1291,66 @@ impl PgWireServerHandlers for ExasolPgWireFactory {
 }
 
 fn map_exasol_result(
-    result: ExasolResult,
+    outcome: ExasolOutcome,
     command: &str,
     row_count_policy: RowCountPolicy,
 ) -> PgWireResult<Vec<GatewayResponse>> {
-    match result {
-        ExasolResult::ResultSet { columns, rows } => Ok(vec![GatewayResponse::TypedQuery {
-            columns: map_exasol_columns(columns),
+    match outcome {
+        ExasolOutcome::ArrowRows(batches) => {
+            let schema = cursor_schema_for(&batches);
+            Ok(vec![GatewayResponse::ArrowQuery {
+                schema,
+                batches,
+                command_tag: None,
+            }])
+        }
+        ExasolOutcome::TypedRows { columns, rows } => Ok(vec![GatewayResponse::TypedQuery {
+            columns,
             rows,
             command_tag: None,
         }]),
-        ExasolResult::RowCount(rows) => Ok(vec![GatewayResponse::Execution {
+        ExasolOutcome::RowCount(rows) => Ok(vec![GatewayResponse::Execution {
             command: command.to_owned(),
             rows: match row_count_policy {
-                RowCountPolicy::Include => Some(rows),
+                RowCountPolicy::Include => Some(rows.max(0) as usize),
                 RowCountPolicy::Omit => None,
             },
         }]),
     }
 }
 
-fn map_exasol_columns(columns: Vec<ExasolColumn>) -> Vec<GatewayColumn> {
-    columns
-        .into_iter()
-        .map(|column| GatewayColumn {
-            name: column.name,
-            data_type: pg_type_for_exasol_data_type(&column.data_type),
+fn map_exasol_columns(schema: &Schema) -> Vec<FieldInfo> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let pg_type = pg_type_for_arrow_field(field);
+            FieldInfo::new(
+                field.name().to_owned(),
+                None,
+                None,
+                pg_type,
+                FieldFormat::Text,
+            )
         })
         .collect()
 }
 
-fn clear_non_hold_cursors<C>(client: &C) -> PgWireResult<()>
+fn cursor_schema_for(batches: &[RecordBatch]) -> SchemaRef {
+    batches
+        .first()
+        .map(|batch| batch.schema())
+        .unwrap_or_else(|| Arc::new(Schema::empty()))
+}
+
+async fn clear_non_hold_cursors<C>(client: &C) -> PgWireResult<()>
 where
     C: ClientInfo,
 {
     let Some(state) = client.session_extensions().get::<SessionState>() else {
         return Ok(());
     };
-    let mut cursors = state
-        .cursors
-        .lock()
-        .map_err(|_| pg_error("58000", "cursor registry lock poisoned"))?;
+    let mut cursors = state.cursors.lock().await;
     cursors.retain(|_, cursor| cursor.hold);
     Ok(())
 }
@@ -1327,21 +1384,23 @@ impl GatewayCursor {
             }
             if count == 0 {
                 let rows = if return_rows {
-                    self.current_row()
+                    self.current_row_step_rows()
                 } else {
-                    Vec::new()
+                    CursorStepRows::empty_like(&self.data)
                 };
-                return Ok(CursorStep {
-                    count: if return_rows { rows.len() } else { 0 },
-                    rows,
-                });
+                let count = if return_rows {
+                    step_rows_count(&rows)
+                } else {
+                    0
+                };
+                return Ok(CursorStep { rows, count });
             }
 
             let start = (self.position + 1).clamp(0, len);
             if start >= len {
                 self.position = len;
                 return Ok(CursorStep {
-                    rows: Vec::new(),
+                    rows: CursorStepRows::empty_like(&self.data),
                     count: 0,
                 });
             }
@@ -1349,9 +1408,9 @@ impl GatewayCursor {
             let requested = count.min(len.saturating_sub(start) as i64) as isize;
             let end = start + requested;
             let rows = if return_rows {
-                self.rows[start as usize..end as usize].to_vec()
+                self.slice_step_rows(start as usize, end as usize)
             } else {
-                Vec::new()
+                CursorStepRows::empty_like(&self.data)
             };
             if requested < count as isize {
                 self.position = len;
@@ -1366,9 +1425,9 @@ impl GatewayCursor {
 
         let start = (self.position + 1).clamp(0, len);
         let rows = if return_rows && start < len {
-            self.rows[start as usize..len as usize].to_vec()
+            self.slice_step_rows(start as usize, len as usize)
         } else {
-            Vec::new()
+            CursorStepRows::empty_like(&self.data)
         };
         let count = len.saturating_sub(start) as usize;
         self.position = len;
@@ -1383,14 +1442,16 @@ impl GatewayCursor {
             }
             if count == 0 {
                 let rows = if return_rows {
-                    self.current_row()
+                    self.current_row_step_rows()
                 } else {
-                    Vec::new()
+                    CursorStepRows::empty_like(&self.data)
                 };
-                return Ok(CursorStep {
-                    count: if return_rows { rows.len() } else { 0 },
-                    rows,
-                });
+                let count = if return_rows {
+                    step_rows_count(&rows)
+                } else {
+                    0
+                };
+                return Ok(CursorStep { rows, count });
             }
 
             let start = if self.position >= len {
@@ -1401,7 +1462,7 @@ impl GatewayCursor {
             if start < 0 {
                 self.position = -1;
                 return Ok(CursorStep {
-                    rows: Vec::new(),
+                    rows: CursorStepRows::empty_like(&self.data),
                     count: 0,
                 });
             }
@@ -1409,12 +1470,9 @@ impl GatewayCursor {
             let requested = count.min((start + 1) as i64) as isize;
             let end = start - requested + 1;
             let rows = if return_rows {
-                (end..=start)
-                    .rev()
-                    .map(|idx| self.rows[idx as usize].clone())
-                    .collect()
+                self.reverse_slice_step_rows(end as usize, (start + 1) as usize)
             } else {
-                Vec::new()
+                CursorStepRows::empty_like(&self.data)
             };
             if requested < count as isize {
                 self.position = -1;
@@ -1435,17 +1493,14 @@ impl GatewayCursor {
         if start < 0 {
             self.position = -1;
             return Ok(CursorStep {
-                rows: Vec::new(),
+                rows: CursorStepRows::empty_like(&self.data),
                 count: 0,
             });
         }
         let rows = if return_rows {
-            (0..=start)
-                .rev()
-                .map(|idx| self.rows[idx as usize].clone())
-                .collect()
+            self.reverse_slice_step_rows(0, (start + 1) as usize)
         } else {
-            Vec::new()
+            CursorStepRows::empty_like(&self.data)
         };
         let count = (start + 1) as usize;
         self.position = -1;
@@ -1457,7 +1512,7 @@ impl GatewayCursor {
         if target == 0 {
             self.position = -1;
             return Ok(CursorStep {
-                rows: Vec::new(),
+                rows: CursorStepRows::empty_like(&self.data),
                 count: 0,
             });
         }
@@ -1478,39 +1533,160 @@ impl GatewayCursor {
         if target < 0 {
             self.position = -1;
             return Ok(CursorStep {
-                rows: Vec::new(),
+                rows: CursorStepRows::empty_like(&self.data),
                 count: 0,
             });
         }
         if target >= len as i64 {
             self.position = len;
             return Ok(CursorStep {
-                rows: Vec::new(),
+                rows: CursorStepRows::empty_like(&self.data),
                 count: 0,
             });
         }
 
         self.position = target as isize;
         let rows = if return_rows {
-            vec![self.rows[target as usize].clone()]
+            self.slice_step_rows(target as usize, (target as usize) + 1)
         } else {
-            Vec::new()
+            CursorStepRows::empty_like(&self.data)
         };
         Ok(CursorStep { rows, count: 1 })
     }
 
-    fn current_row(&self) -> Vec<Vec<Option<String>>> {
-        if self.position >= 0 && (self.position as usize) < self.rows.len() {
-            vec![self.rows[self.position as usize].clone()]
+    fn current_row_step_rows(&self) -> CursorStepRows {
+        let total = self.data_row_count() as isize;
+        if self.position >= 0 && self.position < total {
+            self.slice_step_rows(self.position as usize, self.position as usize + 1)
         } else {
-            Vec::new()
+            CursorStepRows::empty_like(&self.data)
+        }
+    }
+
+    fn data_row_count(&self) -> usize {
+        match &self.data {
+            CursorData::Arrow { batches, .. } => total_rows(batches),
+            CursorData::Typed { rows, .. } => rows.len(),
+        }
+    }
+
+    fn slice_step_rows(&self, start: usize, end: usize) -> CursorStepRows {
+        match &self.data {
+            CursorData::Arrow { batches, .. } => CursorStepRows::Arrow {
+                batches: slice_batches(batches, start, end),
+            },
+            CursorData::Typed { rows, .. } => CursorStepRows::Typed {
+                rows: if start >= end || start >= rows.len() {
+                    Vec::new()
+                } else {
+                    rows[start..end.min(rows.len())].to_vec()
+                },
+            },
+        }
+    }
+
+    fn reverse_slice_step_rows(&self, start: usize, end: usize) -> CursorStepRows {
+        match &self.data {
+            CursorData::Arrow { batches, .. } => CursorStepRows::Arrow {
+                batches: reverse_slice_batches(batches, start, end),
+            },
+            CursorData::Typed { rows, .. } => {
+                let upper = end.min(rows.len());
+                let slice = if start >= upper {
+                    Vec::new()
+                } else {
+                    let mut slice = rows[start..upper].to_vec();
+                    slice.reverse();
+                    slice
+                };
+                CursorStepRows::Typed { rows: slice }
+            }
         }
     }
 
     fn len(&self) -> PgWireResult<isize> {
-        isize::try_from(self.rows.len())
+        isize::try_from(self.data_row_count())
             .map_err(|_| pg_error("54000", "cursor result set is too large"))
     }
+
+    fn metadata(&self) -> CursorMetadata {
+        match &self.data {
+            CursorData::Arrow { schema, .. } => CursorMetadata::Arrow {
+                schema: schema.clone(),
+            },
+            CursorData::Typed { columns, .. } => CursorMetadata::Typed {
+                columns: columns.clone(),
+            },
+        }
+    }
+}
+
+fn step_rows_count(rows: &CursorStepRows) -> usize {
+    match rows {
+        CursorStepRows::Arrow { batches } => total_rows(batches),
+        CursorStepRows::Typed { rows } => rows.len(),
+    }
+}
+
+fn total_rows(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn slice_batches(batches: &[RecordBatch], start: usize, end: usize) -> Vec<RecordBatch> {
+    if start >= end {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for batch in batches {
+        let len = batch.num_rows();
+        if len == 0 {
+            continue;
+        }
+        let batch_start = offset;
+        let batch_end = offset + len;
+        offset = batch_end;
+
+        if batch_end <= start {
+            continue;
+        }
+        if batch_start >= end {
+            break;
+        }
+
+        let local_start = start.saturating_sub(batch_start);
+        let local_end = (end - batch_start).min(len);
+        if local_end > local_start {
+            out.push(batch.slice(local_start, local_end - local_start));
+        }
+    }
+    out
+}
+
+fn reverse_slice_batches(batches: &[RecordBatch], start: usize, end: usize) -> Vec<RecordBatch> {
+    let mut slices = slice_batches(batches, start, end);
+    let mut reversed = Vec::with_capacity(slices.len());
+    while let Some(slice) = slices.pop() {
+        reversed.push(reverse_batch(&slice));
+    }
+    reversed
+}
+
+fn reverse_batch(batch: &RecordBatch) -> RecordBatch {
+    let len = batch.num_rows();
+    if len <= 1 {
+        return batch.clone();
+    }
+    let indices: arrow::array::UInt32Array = (0..len as u32).rev().collect::<Vec<u32>>().into();
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|col| {
+            arrow::compute::take(col.as_ref(), &indices, None)
+                .expect("reverse-take on cursor batch never fails for typed columns")
+        })
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(batch.schema(), columns).expect("schema preserved under reverse")
 }
 
 fn direction_requires_scroll(direction: CursorDirection) -> bool {
@@ -1533,11 +1709,17 @@ impl GatewayResponse {
                 .cloned()
                 .map(|name| FieldInfo::new(name, None, None, Type::TEXT, FieldFormat::Text))
                 .collect(),
+            GatewayResponse::ArrowQuery { schema, .. } => map_exasol_columns(schema),
             GatewayResponse::TypedQuery { columns, .. } => columns
                 .iter()
-                .cloned()
                 .map(|column| {
-                    FieldInfo::new(column.name, None, None, column.data_type, FieldFormat::Text)
+                    FieldInfo::new(
+                        column.name.clone(),
+                        None,
+                        None,
+                        pg_type_for_exasol_data_type(&column.data_type),
+                        FieldFormat::Text,
+                    )
                 })
                 .collect(),
             _ => Vec::new(),
@@ -1554,6 +1736,15 @@ impl TryFrom<GatewayResponse> for Response {
             GatewayResponse::Query { columns, rows } => {
                 Response::Query(query_response(columns, rows)?)
             }
+            GatewayResponse::ArrowQuery {
+                schema,
+                batches,
+                command_tag,
+            } => Response::Query(query_response_arrow(
+                schema,
+                batches,
+                command_tag.as_deref(),
+            )?),
             GatewayResponse::TypedQuery {
                 columns,
                 rows,
@@ -1584,7 +1775,7 @@ impl TryFrom<GatewayResponse> for Response {
     }
 }
 
-fn cache_extended_result<C>(
+async fn cache_extended_result<C>(
     client: &C,
     portal_name: &str,
     response: GatewayResponse,
@@ -1596,15 +1787,12 @@ where
         .session_extensions()
         .get::<SessionState>()
         .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
-    let mut cache = state
-        .extended_results
-        .lock()
-        .map_err(|_| pg_error("58000", "extended result cache lock poisoned"))?;
+    let mut cache = state.extended_results.lock().await;
     cache.insert(portal_name.to_owned(), response);
     Ok(())
 }
 
-fn take_cached_extended_result<C>(
+async fn take_cached_extended_result<C>(
     client: &C,
     portal_name: &str,
 ) -> PgWireResult<Option<GatewayResponse>>
@@ -1614,10 +1802,7 @@ where
     let Some(state) = client.session_extensions().get::<SessionState>() else {
         return Ok(None);
     };
-    let mut cache = state
-        .extended_results
-        .lock()
-        .map_err(|_| pg_error("58000", "extended result cache lock poisoned"))?;
+    let mut cache = state.extended_results.lock().await;
     Ok(cache.remove(portal_name))
 }
 
@@ -1782,27 +1967,41 @@ fn query_response(
     columns: Vec<String>,
     rows: Vec<Vec<Option<String>>>,
 ) -> PgWireResult<QueryResponse> {
-    query_response_typed(
-        columns
-            .into_iter()
-            .map(|name| GatewayColumn {
-                name,
-                data_type: Type::TEXT,
-            })
-            .collect(),
-        rows,
-        None,
-    )
+    let fields = columns
+        .into_iter()
+        .map(|name| FieldInfo::new(name, None, None, Type::TEXT, FieldFormat::Text))
+        .collect::<Vec<_>>();
+    let schema = Arc::new(fields);
+    let schema_for_rows = schema.clone();
+    let column_count = schema_for_rows.len();
+    let mut encoder = DataRowEncoder::new(schema_for_rows.clone());
+    let row_stream = stream::iter(rows).map(move |row| {
+        for idx in 0..column_count {
+            let value = row.get(idx).cloned().unwrap_or(None);
+            encoder.encode_field(&value)?;
+        }
+        Ok(encoder.take_row())
+    });
+
+    Ok(QueryResponse::new(schema, row_stream))
 }
 
 fn query_response_typed(
-    columns: Vec<GatewayColumn>,
+    columns: Vec<ExasolColumn>,
     rows: Vec<Vec<Option<String>>>,
     command_tag: Option<&str>,
 ) -> PgWireResult<QueryResponse> {
     let fields = columns
         .into_iter()
-        .map(|column| FieldInfo::new(column.name, None, None, column.data_type, FieldFormat::Text))
+        .map(|column| {
+            FieldInfo::new(
+                column.name,
+                None,
+                None,
+                pg_type_for_exasol_data_type(&column.data_type),
+                FieldFormat::Text,
+            )
+        })
         .collect::<Vec<_>>();
     let schema = Arc::new(fields);
     let schema_for_rows = schema.clone();
@@ -1876,6 +2075,194 @@ fn pg_type_for_exasol_data_type(data_type: &serde_json::Value) -> Type {
     }
 }
 
+fn query_response_arrow(
+    arrow_schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    command_tag: Option<&str>,
+) -> PgWireResult<QueryResponse> {
+    let fields = map_exasol_columns(arrow_schema.as_ref());
+    let pg_schema = Arc::new(fields);
+    let pg_schema_for_rows = pg_schema.clone();
+    let mut encoder = DataRowEncoder::new(pg_schema_for_rows.clone());
+    let row_stream = stream::iter(
+        batches
+            .into_iter()
+            .flat_map(move |batch| encode_batch_rows(&batch, &mut encoder).into_iter()),
+    );
+
+    let mut response = QueryResponse::new(pg_schema, row_stream);
+    if let Some(command_tag) = command_tag {
+        response.set_command_tag(command_tag);
+    }
+    Ok(response)
+}
+
+fn encode_batch_rows(
+    batch: &RecordBatch,
+    encoder: &mut DataRowEncoder,
+) -> Vec<PgWireResult<DataRow>> {
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return Vec::new();
+    }
+
+    let options = FormatOptions::new().with_display_error(false);
+    let formatters: Vec<ArrayFormatter<'_>> = match batch
+        .columns()
+        .iter()
+        .map(|col| ArrayFormatter::try_new(col.as_ref(), &options))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(formatters) => formatters,
+        Err(err) => {
+            return vec![Err(pg_error(
+                "XX000",
+                format!("failed to build Arrow formatters: {err}"),
+            ))];
+        }
+    };
+
+    let mut rows = Vec::with_capacity(num_rows);
+    for row_idx in 0..num_rows {
+        rows.push(encode_one_row(batch, &formatters, row_idx, encoder));
+    }
+    rows
+}
+
+fn encode_one_row(
+    batch: &RecordBatch,
+    formatters: &[ArrayFormatter<'_>],
+    row_idx: usize,
+    encoder: &mut DataRowEncoder,
+) -> PgWireResult<DataRow> {
+    for (col_idx, col) in batch.columns().iter().enumerate() {
+        if col.is_null(row_idx) {
+            encoder.encode_field(&None::<i8>)?;
+        } else {
+            let value = formatters[col_idx]
+                .value(row_idx)
+                .try_to_string()
+                .map_err(|err| {
+                    pg_error("XX000", format!("failed to render Arrow result row: {err}"))
+                })?;
+            encoder.encode_field(&Some(value))?;
+        }
+    }
+    Ok(encoder.take_row())
+}
+
+fn render_arrow_batches_as_strings(
+    batches: &[RecordBatch],
+) -> Result<Vec<Vec<Option<String>>>, arrow::error::ArrowError> {
+    let mut rows = Vec::with_capacity(total_rows(batches));
+    let options = FormatOptions::new().with_display_error(false);
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let formatters: Vec<ArrayFormatter<'_>> = batch
+            .columns()
+            .iter()
+            .map(|col| ArrayFormatter::try_new(col.as_ref(), &options))
+            .collect::<Result<_, _>>()?;
+        for row_idx in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(batch.num_columns());
+            for (col_idx, col) in batch.columns().iter().enumerate() {
+                if col.is_null(row_idx) {
+                    row.push(None);
+                } else {
+                    let formatter = &formatters[col_idx];
+                    let value = formatter.value(row_idx).try_to_string()?;
+                    row.push(Some(value));
+                }
+            }
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+fn arrow_batches_to_text_rows(batches: &[RecordBatch]) -> Vec<Vec<Option<String>>> {
+    render_arrow_batches_as_strings(batches).unwrap_or_else(|err| {
+        warn!(error = %err, "failed to render Arrow batch rows as text for metadata fallback");
+        Vec::new()
+    })
+}
+
+fn pg_type_for_arrow_field(field: &Field) -> Type {
+    if let Some(exasol_type) = field.metadata().get("exasol:type")
+        && let Some(pg_type) = pg_type_from_exasol_metadata(exasol_type, field)
+    {
+        return pg_type;
+    }
+    pg_type_for_arrow_data_type(field.data_type())
+}
+
+fn pg_type_from_exasol_metadata(exasol_type_json: &str, field: &Field) -> Option<Type> {
+    let value: serde_json::Value = serde_json::from_str(exasol_type_json).ok()?;
+    let type_name = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)?
+        .to_ascii_uppercase();
+    match type_name.as_str() {
+        "BOOLEAN" => Some(Type::BOOL),
+        "DECIMAL" => {
+            let precision = field
+                .metadata()
+                .get("exasol:precision")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(36);
+            let scale = field
+                .metadata()
+                .get("exasol:scale")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            Some(decimal_pg_type(precision, scale))
+        }
+        "DOUBLE" => Some(Type::FLOAT8),
+        "DATE" => Some(Type::DATE),
+        "TIMESTAMP" => {
+            if matches!(field.data_type(), DataType::Timestamp(_, Some(_))) {
+                Some(Type::TIMESTAMPTZ)
+            } else {
+                Some(Type::TIMESTAMP)
+            }
+        }
+        "CHAR" | "VARCHAR" | "HASHTYPE" => Some(Type::VARCHAR),
+        _ => None,
+    }
+}
+
+fn pg_type_for_arrow_data_type(data_type: &DataType) -> Type {
+    match data_type {
+        DataType::Boolean => Type::BOOL,
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => Type::INT4,
+        DataType::Int64 | DataType::UInt64 => Type::NUMERIC,
+        DataType::Float32 | DataType::Float64 => Type::FLOAT8,
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            decimal_pg_type(*precision as i64, *scale as i64)
+        }
+        DataType::Date32 | DataType::Date64 => Type::DATE,
+        DataType::Timestamp(_, None) => Type::TIMESTAMP,
+        DataType::Timestamp(_, Some(_)) => Type::TIMESTAMPTZ,
+        DataType::Utf8 | DataType::LargeUtf8 => Type::VARCHAR,
+        _ => Type::TEXT,
+    }
+}
+
+fn decimal_pg_type(precision: i64, scale: i64) -> Type {
+    if scale == 0 && precision <= 9 {
+        Type::INT4
+    } else {
+        Type::NUMERIC
+    }
+}
+
 fn map_exasol_connection_error(error: ExasolError) -> PgWireError {
     pg_error(
         "28000",
@@ -1936,6 +2323,8 @@ fn split_simple_query(query: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::TimeUnit;
 
     #[test]
     fn rewrites_foreign_server_projection() {
@@ -2048,31 +2437,47 @@ mod tests {
     }
 
     #[test]
-    fn maps_exasol_decimal_result_type_to_postgres_numeric_type() {
-        let data_type = serde_json::json!({
-            "type": "DECIMAL",
-            "precision": 1,
-            "scale": 0
-        });
-        assert_eq!(pg_type_for_exasol_data_type(&data_type), Type::INT4);
+    fn maps_exasol_decimal_field_to_postgres_int4_when_low_precision() {
+        let field = decimal_field("count", 1, 0);
+        assert_eq!(pg_type_for_arrow_field(&field), Type::INT4);
     }
 
     #[test]
-    fn maps_exasol_varchar_result_type_to_postgres_varchar_type() {
-        let data_type = serde_json::json!({
-            "type": "VARCHAR",
-            "size": 2000
-        });
-        assert_eq!(pg_type_for_exasol_data_type(&data_type), Type::VARCHAR);
+    fn maps_exasol_decimal_field_to_postgres_numeric_when_scaled() {
+        let field = decimal_field("price", 18, 2);
+        assert_eq!(pg_type_for_arrow_field(&field), Type::NUMERIC);
+    }
+
+    #[test]
+    fn maps_exasol_varchar_field_to_postgres_varchar_type() {
+        let field = varchar_field("name", 2000);
+        assert_eq!(pg_type_for_arrow_field(&field), Type::VARCHAR);
+    }
+
+    #[test]
+    fn maps_exasol_timestamp_with_local_time_zone_to_timestamptz() {
+        let field = Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )
+        .with_metadata(exasol_metadata(
+            r#"{"type":"TIMESTAMP","with_local_time_zone":true}"#,
+            &[],
+        ));
+        assert_eq!(pg_type_for_arrow_field(&field), Type::TIMESTAMPTZ);
     }
 
     #[test]
     fn maps_dml_row_count_to_statement_command_tag() {
-        let response =
-            map_exasol_result(ExasolResult::RowCount(3), "UPDATE", RowCountPolicy::Include)
-                .unwrap()
-                .pop()
-                .unwrap();
+        let response = map_exasol_result(
+            ExasolOutcome::RowCount(3),
+            "UPDATE",
+            RowCountPolicy::Include,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
 
         assert!(matches!(
             response,
@@ -2083,7 +2488,7 @@ mod tests {
     #[test]
     fn omits_row_count_for_ddl_command_tag() {
         let response = map_exasol_result(
-            ExasolResult::RowCount(0),
+            ExasolOutcome::RowCount(0),
             "CREATE TABLE",
             RowCountPolicy::Omit,
         )
@@ -2095,6 +2500,31 @@ mod tests {
             response,
             GatewayResponse::Execution { command, rows } if command == "CREATE TABLE" && rows.is_none()
         ));
+    }
+
+    #[test]
+    fn maps_arrow_outcome_to_typed_response_using_field_metadata() {
+        let batch = int_batch("id", &[Some(1), Some(2)]);
+        let outcome = ExasolOutcome::ArrowRows(vec![batch]);
+        let response = map_exasol_result(outcome, "SELECT", RowCountPolicy::Omit)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        match response {
+            GatewayResponse::ArrowQuery {
+                schema,
+                batches,
+                command_tag,
+            } => {
+                assert_eq!(schema.fields().len(), 1);
+                assert_eq!(schema.field(0).name(), "id");
+                assert_eq!(batches.len(), 1);
+                assert_eq!(batches[0].num_rows(), 2);
+                assert!(command_tag.is_none());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     #[test]
@@ -2120,24 +2550,20 @@ mod tests {
         let step = cursor
             .apply(CursorDirection::Forward(Some(2)), true)
             .unwrap();
+        assert_eq!(step.count, 2);
         assert_eq!(
-            step,
-            CursorStep {
-                rows: vec![vec![Some("1".to_owned())], vec![Some("2".to_owned())]],
-                count: 2,
-            }
+            collect_first_column_strings(&expect_arrow_batches(&step.rows)),
+            vec![Some("1".to_owned()), Some("2".to_owned())]
         );
         assert_eq!(cursor.position, 1);
 
         let step = cursor
             .apply(CursorDirection::Backward(Some(1)), true)
             .unwrap();
+        assert_eq!(step.count, 1);
         assert_eq!(
-            step,
-            CursorStep {
-                rows: vec![vec![Some("1".to_owned())]],
-                count: 1,
-            }
+            collect_first_column_strings(&expect_arrow_batches(&step.rows)),
+            vec![Some("1".to_owned())]
         );
         assert_eq!(cursor.position, 0);
     }
@@ -2147,19 +2573,53 @@ mod tests {
         let mut cursor = test_cursor(true);
 
         let step = cursor.apply(CursorDirection::Last, true).unwrap();
-        assert_eq!(step.rows, vec![vec![Some("3".to_owned())]]);
+        assert_eq!(
+            collect_first_column_strings(&expect_arrow_batches(&step.rows)),
+            vec![Some("3".to_owned())]
+        );
         assert_eq!(step.count, 1);
         assert_eq!(cursor.position, 2);
 
         let step = cursor.apply(CursorDirection::Relative(-2), true).unwrap();
-        assert_eq!(step.rows, vec![vec![Some("1".to_owned())]]);
+        assert_eq!(
+            collect_first_column_strings(&expect_arrow_batches(&step.rows)),
+            vec![Some("1".to_owned())]
+        );
         assert_eq!(step.count, 1);
         assert_eq!(cursor.position, 0);
 
         let step = cursor.apply(CursorDirection::All, false).unwrap();
         assert_eq!(step.count, 2);
-        assert!(step.rows.is_empty());
+        assert!(expect_arrow_batches(&step.rows).is_empty());
         assert_eq!(cursor.position, 3);
+    }
+
+    #[test]
+    fn cursor_forward_spans_multiple_record_batches() {
+        let mut cursor = test_cursor_two_batches();
+
+        let step = cursor
+            .apply(CursorDirection::Forward(Some(3)), true)
+            .unwrap();
+        assert_eq!(step.count, 3);
+        assert_eq!(
+            collect_first_column_strings(&expect_arrow_batches(&step.rows)),
+            vec![
+                Some("10".to_owned()),
+                Some("20".to_owned()),
+                Some("30".to_owned()),
+            ]
+        );
+        assert_eq!(cursor.position, 2);
+
+        let step = cursor
+            .apply(CursorDirection::Forward(Some(10)), true)
+            .unwrap();
+        assert_eq!(step.count, 2);
+        assert_eq!(
+            collect_first_column_strings(&expect_arrow_batches(&step.rows)),
+            vec![Some("40".to_owned()), Some("50".to_owned())]
+        );
     }
 
     #[test]
@@ -2175,17 +2635,25 @@ mod tests {
 
     #[test]
     fn can_set_fetch_query_response_command_tag() {
-        let response = query_response_typed(
-            vec![GatewayColumn {
-                name: "id".to_owned(),
-                data_type: Type::INT4,
-            }],
-            vec![vec![Some("1".to_owned())]],
-            Some("FETCH"),
-        )
-        .unwrap();
+        let batch = int_batch("id", &[Some(1)]);
+        let schema = batch.schema();
+        let response = query_response_arrow(schema, vec![batch], Some("FETCH")).unwrap();
 
         assert_eq!(response.command_tag(), "FETCH");
+    }
+
+    #[test]
+    fn renders_arrow_batches_as_text_rows() {
+        let batch = int_batch("id", &[Some(1), None, Some(3)]);
+        let rows = arrow_batches_to_text_rows(&[batch]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("1".to_owned())],
+                vec![None],
+                vec![Some("3".to_owned())],
+            ]
+        );
     }
 
     #[test]
@@ -2202,19 +2670,240 @@ mod tests {
     }
 
     fn test_cursor(scroll: bool) -> GatewayCursor {
+        let batch = int_batch("id", &[Some(1), Some(2), Some(3)]);
+        let schema = batch.schema();
         GatewayCursor {
-            columns: vec![GatewayColumn {
-                name: "id".to_owned(),
-                data_type: Type::INT4,
-            }],
-            rows: vec![
-                vec![Some("1".to_owned())],
-                vec![Some("2".to_owned())],
-                vec![Some("3".to_owned())],
-            ],
+            data: CursorData::Arrow {
+                schema,
+                batches: vec![batch],
+            },
             position: -1,
             scroll,
             hold: false,
         }
+    }
+
+    fn test_cursor_two_batches() -> GatewayCursor {
+        let first = int_batch("id", &[Some(10), Some(20), Some(30)]);
+        let second = int_batch("id", &[Some(40), Some(50)]);
+        let schema = first.schema();
+        GatewayCursor {
+            data: CursorData::Arrow {
+                schema,
+                batches: vec![first, second],
+            },
+            position: -1,
+            scroll: true,
+            hold: false,
+        }
+    }
+
+    fn test_typed_cursor(scroll: bool) -> GatewayCursor {
+        let columns = vec![ExasolColumn {
+            name: "id".to_owned(),
+            data_type: serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 0}),
+        }];
+        let rows = vec![
+            vec![Some("1".to_owned())],
+            vec![Some("2".to_owned())],
+            vec![Some("3".to_owned())],
+        ];
+        GatewayCursor {
+            data: CursorData::Typed { columns, rows },
+            position: -1,
+            scroll,
+            hold: false,
+        }
+    }
+
+    fn int_batch(name: &str, values: &[Option<i64>]) -> RecordBatch {
+        let field = Field::new(name, DataType::Int64, true).with_metadata(exasol_metadata(
+            r#"{"type":"DECIMAL","precision":18,"scale":0}"#,
+            &[("exasol:precision", "18"), ("exasol:scale", "0")],
+        ));
+        let schema = Arc::new(Schema::new(vec![field]));
+        let array = Int64Array::from(values.to_vec());
+        RecordBatch::try_new(schema, vec![Arc::new(array) as ArrayRef]).unwrap()
+    }
+
+    fn decimal_field(name: &str, precision: i64, scale: i64) -> Field {
+        Field::new(
+            name,
+            DataType::Decimal128(precision as u8, scale as i8),
+            true,
+        )
+        .with_metadata(exasol_metadata(
+            &format!(r#"{{"type":"DECIMAL","precision":{precision},"scale":{scale}}}"#),
+            &[
+                ("exasol:precision", &precision.to_string()),
+                ("exasol:scale", &scale.to_string()),
+            ],
+        ))
+    }
+
+    fn varchar_field(name: &str, size: i64) -> Field {
+        Field::new(name, DataType::Utf8, true).with_metadata(exasol_metadata(
+            &format!(r#"{{"type":"VARCHAR","size":{size}}}"#),
+            &[("exasol:size", &size.to_string())],
+        ))
+    }
+
+    fn exasol_metadata(type_json: &str, extras: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        map.insert("exasol:type".to_owned(), type_json.to_owned());
+        for (k, v) in extras {
+            map.insert((*k).to_owned(), (*v).to_owned());
+        }
+        map
+    }
+
+    fn collect_first_column_strings(batches: &[RecordBatch]) -> Vec<Option<String>> {
+        arrow_batches_to_text_rows(batches)
+            .into_iter()
+            .map(|row| row.into_iter().next().unwrap_or(None))
+            .collect()
+    }
+
+    fn expect_arrow_batches(rows: &CursorStepRows) -> Vec<RecordBatch> {
+        match rows {
+            CursorStepRows::Arrow { batches } => batches.clone(),
+            CursorStepRows::Typed { .. } => panic!("expected arrow cursor step rows"),
+        }
+    }
+
+    fn expect_typed_rows(rows: &CursorStepRows) -> Vec<Vec<Option<String>>> {
+        match rows {
+            CursorStepRows::Typed { rows } => rows.clone(),
+            CursorStepRows::Arrow { .. } => panic!("expected typed cursor step rows"),
+        }
+    }
+
+    #[test]
+    fn maps_typed_outcome_to_typed_query_response() {
+        let columns = vec![ExasolColumn {
+            name: "id".to_owned(),
+            data_type: serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 0}),
+        }];
+        let rows = vec![vec![Some("1".to_owned())], vec![Some("2".to_owned())]];
+        let outcome = ExasolOutcome::TypedRows {
+            columns: columns.clone(),
+            rows: rows.clone(),
+        };
+
+        let response = map_exasol_result(outcome, "SELECT", RowCountPolicy::Omit)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        match response {
+            GatewayResponse::TypedQuery {
+                columns: out_columns,
+                rows: out_rows,
+                command_tag,
+            } => {
+                assert_eq!(out_columns.len(), 1);
+                assert_eq!(out_columns[0].name, "id");
+                assert_eq!(out_rows, rows);
+                assert!(command_tag.is_none());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_query_response_round_trips_through_try_into_response() {
+        let columns = vec![ExasolColumn {
+            name: "name".to_owned(),
+            data_type: serde_json::json!({"type": "VARCHAR", "size": 2000}),
+        }];
+        let response = GatewayResponse::TypedQuery {
+            columns,
+            rows: vec![vec![Some("alice".to_owned())]],
+            command_tag: Some("SELECT".to_owned()),
+        };
+
+        match Response::try_from(response).unwrap() {
+            Response::Query(query) => {
+                assert_eq!(query.command_tag(), "SELECT");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_query_response_fields_use_pg_type_mapping() {
+        let columns = vec![
+            ExasolColumn {
+                name: "amount".to_owned(),
+                data_type: serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 2}),
+            },
+            ExasolColumn {
+                name: "label".to_owned(),
+                data_type: serde_json::json!({"type": "VARCHAR", "size": 100}),
+            },
+        ];
+        let response = GatewayResponse::TypedQuery {
+            columns,
+            rows: Vec::new(),
+            command_tag: None,
+        };
+        let fields = response.fields();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name(), "amount");
+        assert_eq!(fields[0].datatype(), &Type::NUMERIC);
+        assert_eq!(fields[1].name(), "label");
+        assert_eq!(fields[1].datatype(), &Type::VARCHAR);
+    }
+
+    #[test]
+    fn typed_cursor_steps_forward_and_returns_typed_rows() {
+        let mut cursor = test_typed_cursor(true);
+
+        let step = cursor
+            .apply(CursorDirection::Forward(Some(2)), true)
+            .unwrap();
+        assert_eq!(step.count, 2);
+        assert_eq!(
+            expect_typed_rows(&step.rows),
+            vec![vec![Some("1".to_owned())], vec![Some("2".to_owned())]]
+        );
+        assert_eq!(cursor.position, 1);
+
+        let step = cursor.apply(CursorDirection::All, true).unwrap();
+        assert_eq!(step.count, 1);
+        assert_eq!(
+            expect_typed_rows(&step.rows),
+            vec![vec![Some("3".to_owned())]]
+        );
+        assert_eq!(cursor.position, 3);
+    }
+
+    #[test]
+    fn typed_cursor_backward_reverses_rows() {
+        let mut cursor = test_typed_cursor(true);
+
+        cursor
+            .apply(CursorDirection::Forward(Some(3)), true)
+            .unwrap();
+        let step = cursor
+            .apply(CursorDirection::Backward(Some(2)), true)
+            .unwrap();
+        assert_eq!(step.count, 2);
+        assert_eq!(
+            expect_typed_rows(&step.rows),
+            vec![vec![Some("2".to_owned())], vec![Some("1".to_owned())]]
+        );
+        assert_eq!(cursor.position, 0);
+    }
+
+    #[test]
+    fn typed_cursor_move_returns_empty_rows_with_count() {
+        let mut cursor = test_typed_cursor(true);
+        let step = cursor
+            .apply(CursorDirection::Forward(Some(2)), false)
+            .unwrap();
+        assert_eq!(step.count, 2);
+        assert!(expect_typed_rows(&step.rows).is_empty());
+        assert_eq!(cursor.position, 1);
     }
 }

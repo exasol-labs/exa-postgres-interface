@@ -13,6 +13,16 @@ opened (matching DBeaver's typical `"DEMO","public"` form), and lowercases
 DBeaver renders system types as `numeric(18)` instead of
 `"PG_CATALOG"."NUMERIC"(18)`.
 
+**Dual-transport support:** the gateway ships with two Exasol transport
+backends selectable via `exasol.transport` in the config file. The default is
+`"websocket"` (hand-rolled WebSocket JSON protocol, no extra dependencies). Set
+`exasol.transport = "arrow"` to use the
+[`exarrow-rs`](https://github.com/exasol-labs/exarrow-rs) Apache Arrow driver
+(result sets travel as `RecordBatch` values, fully async on Tokio). The
+transport is fixed at startup; switching transports requires a restart. The
+rest of the configuration surface (`exasol.dsn`, `certificate_fingerprint`,
+`validate_certificate`) is identical for both transports.
+
 ## Install
 
 Download the Linux x86_64 release (built for `x86_64-unknown-linux-musl`, no
@@ -122,8 +132,27 @@ Full matrix and details:
 
 ```bash
 cargo fmt --check
-cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
 cargo build --release
+```
+
+Live Exasol integration tests live under `tests/` and are marked `#[ignore]`
+so they only run on demand. They expect the test instance defined in
+`tests/common/mod.rs` (default `3.124.151.144:8563`, user `sys`). The instance
+must already have `PG_CATALOG` and `INFORMATION_SCHEMA` installed — bootstrap
+once with:
+
+```bash
+python3 scripts/exasol_exec.py \
+  --dsn 3.124.151.144:8563 --user sys --password EXASOL_PASSWORD \
+  --file sql/postgres_catalog_compatibility.sql
+```
+
+Then run the suite:
+
+```bash
+cargo test --all -- --ignored --test-threads=1
 ```
 
 JDBC compatibility suite against a running gateway:
@@ -135,12 +164,17 @@ scripts/run_jdbc_compatibility_suite.sh \
 ```
 
 Releases are produced by [scripts/package_release.sh](scripts/package_release.sh)
-and the GitHub Actions workflow that fires on `v*` tags.
+and the GitHub Actions workflow that fires on `v*` tags. The script defaults
+to `x86_64-unknown-linux-musl`; pass `TARGET_TRIPLE=x86_64-unknown-linux-gnu`
+on hosts without the musl cross-toolchain.
 
 ## Performance
 
-Measurable overhead vs. a direct Exasol JDBC connection: roughly `140–155 ms`
-fixed cost per small query, `1.11–1.38x` direct-JDBC time on 1M–10M row
-transfers, and near-parity once Exasol execution time dominates. Re-benchmark
-in your target environment with `scripts/run_gateway_vs_exasol_benchmark.sh`
-before treating these numbers as acceptance criteria.
+Measurable overhead vs. a direct Exasol JDBC connection on `v0.1.0`: roughly
+`140–155 ms` fixed cost per small query, `1.11–1.38x` direct-JDBC time on
+1M–10M row transfers, and near-parity once Exasol execution time dominates.
+The Arrow transport (`exasol.transport = "arrow"`) can shift these numbers
+(Arrow-backed result handling, async session, fewer string conversions);
+re-benchmark in your target environment with
+`scripts/run_gateway_vs_exasol_benchmark.sh` before treating any of them as
+acceptance criteria.

@@ -3,6 +3,36 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+pub const DEFAULT_TRANSPORT: &str = "websocket";
+
+fn default_transport() -> String {
+    DEFAULT_TRANSPORT.to_owned()
+}
+
+/// The data-transport protocol used to connect to Exasol.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Transport {
+    WebSocket,
+    Arrow,
+}
+
+impl Transport {
+    /// Parse transport from the config value, returning a clear error for unknown variants.
+    pub fn from_config(
+        config: &ExasolConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        match config.transport.as_str() {
+            "websocket" => Ok(Transport::WebSocket),
+            "arrow" => Ok(Transport::Arrow),
+            other => Err(format!(
+                "unknown transport '{}': accepted values are 'websocket' and 'arrow'",
+                other
+            )
+            .into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -39,6 +69,8 @@ pub struct ExasolConfig {
     pub pass_client_credentials: bool,
     #[serde(default)]
     pub schema: String,
+    #[serde(default = "default_transport")]
+    pub transport: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,6 +119,7 @@ impl AppConfig {
         {
             return Err("server.tls_cert_path and server.tls_key_path must be set together".into());
         }
+        Transport::from_config(&config.exasol)?;
         Ok(config)
     }
 
@@ -168,5 +201,59 @@ mod tests {
             "PG_CATALOG.PG_SQL_PREPROCESSOR"
         );
         assert_eq!(config.translation.session_init_sql.len(), 1);
+    }
+
+    #[test]
+    fn transport_defaults_to_websocket() {
+        let raw = "[exasol]\ndsn = \"127.0.0.1:8563\"\n";
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(config.exasol.transport, DEFAULT_TRANSPORT);
+        assert_eq!(
+            Transport::from_config(&config.exasol).unwrap(),
+            Transport::WebSocket
+        );
+    }
+
+    #[test]
+    fn explicit_websocket_transport_parses() {
+        let raw = "[exasol]\ndsn = \"127.0.0.1:8563\"\ntransport = \"websocket\"\n";
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            Transport::from_config(&config.exasol).unwrap(),
+            Transport::WebSocket
+        );
+    }
+
+    #[test]
+    fn explicit_arrow_transport_parses() {
+        let raw = "[exasol]\ndsn = \"127.0.0.1:8563\"\ntransport = \"arrow\"\n";
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            Transport::from_config(&config.exasol).unwrap(),
+            Transport::Arrow
+        );
+    }
+
+    #[test]
+    fn unknown_transport_value_fails_config_load() {
+        let raw = "[exasol]\ndsn = \"127.0.0.1:8563\"\ntransport = \"tcp\"\n";
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        let err = Transport::from_config(&config.exasol).unwrap_err();
+        assert!(err.to_string().contains("unknown transport"));
+        assert!(err.to_string().contains("websocket"));
+        assert!(err.to_string().contains("arrow"));
+    }
+
+    #[test]
+    fn from_file_rejects_unknown_transport() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            "[exasol]\ndsn = \"127.0.0.1:8563\"\ntransport = \"tcp\""
+        )
+        .unwrap();
+        let err = AppConfig::from_file(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("unknown transport"));
     }
 }
