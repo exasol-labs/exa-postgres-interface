@@ -15,10 +15,11 @@ DBeaver renders system types as `numeric(18)` instead of
 
 **Dual-transport support:** the gateway ships with two Exasol transport
 backends selectable via `exasol.transport` in the config file. The default is
-`"websocket"` (hand-rolled WebSocket JSON protocol, no extra dependencies). Set
-`exasol.transport = "arrow"` to use the
+`"arrow"`, which uses the
 [`exarrow-rs`](https://github.com/exasol-labs/exarrow-rs) Apache Arrow driver
-(result sets travel as `RecordBatch` values, fully async on Tokio). The
+(result sets travel as `RecordBatch` values, fully async on Tokio). Set
+`exasol.transport = "websocket"` to fall back to the hand-rolled WebSocket
+JSON protocol (no extra dependencies, returns typed string rows). The
 transport is fixed at startup; switching transports requires a restart. The
 rest of the configuration surface (`exasol.dsn`, `certificate_fingerprint`,
 `validate_certificate`) is identical for both transports.
@@ -139,13 +140,13 @@ cargo build --release
 
 Live Exasol integration tests live under `tests/` and are marked `#[ignore]`
 so they only run on demand. They expect the test instance defined in
-`tests/common/mod.rs` (default `3.124.151.144:8563`, user `sys`). The instance
+`tests/common/mod.rs` (default `127.0.0.1:9564`, user `sys`). The instance
 must already have `PG_CATALOG` and `INFORMATION_SCHEMA` installed — bootstrap
 once with:
 
 ```bash
 python3 scripts/exasol_exec.py \
-  --dsn 3.124.151.144:8563 --user sys --password EXASOL_PASSWORD \
+  --dsn 127.0.0.1:9564 --user sys --password EXASOL_PASSWORD \
   --file sql/postgres_catalog_compatibility.sql
 ```
 
@@ -173,8 +174,9 @@ on hosts without the musl cross-toolchain.
 Measurable overhead vs. a direct Exasol JDBC connection on `v0.1.0`: roughly
 `140–155 ms` fixed cost per small query, `1.11–1.38x` direct-JDBC time on
 1M–10M row transfers, and near-parity once Exasol execution time dominates.
-The Arrow transport (`exasol.transport = "arrow"`) can shift these numbers
-(Arrow-backed result handling, async session, fewer string conversions);
-re-benchmark in your target environment with
-`scripts/run_gateway_vs_exasol_benchmark.sh` before treating any of them as
-acceptance criteria.
+The default Arrow transport (`exasol.transport = "arrow"`) can shift these
+numbers (Arrow-backed result handling, async session, fewer string
+conversions); the legacy WebSocket transport (`exasol.transport = "websocket"`)
+returns to the typed-string-row path. Re-benchmark in your target environment
+with `scripts/run_gateway_vs_exasol_benchmark.sh` before treating any of these
+numbers as acceptance criteria.

@@ -10,8 +10,8 @@ use exa_postgres_interface::exasol::{ExasolOutcome, ExasolSession};
 use common::{TEST_PASSWORD, TEST_USER, live_exasol_config_for_transport};
 
 #[test]
-fn default_transport_is_websocket() {
-    assert_eq!(DEFAULT_TRANSPORT, "websocket");
+fn default_transport_is_arrow() {
+    assert_eq!(DEFAULT_TRANSPORT, "arrow");
 }
 
 #[test]
@@ -19,7 +19,7 @@ fn transport_choice_is_fixed_for_session_lifetime() {
     // The transport is selected at connect time and does not change mid-session.
     // This is a compile-time invariant (`Box<dyn ExasolTransport>` is fixed at
     // connect), so we assert the configuration-level side of the contract:
-    // `DEFAULT_TRANSPORT == "websocket"` and `Transport::from_config` parses
+    // `DEFAULT_TRANSPORT == "arrow"` and `Transport::from_config` parses
     // it deterministically.
     let config = ExasolConfig {
         transport: DEFAULT_TRANSPORT.to_owned(),
@@ -27,7 +27,7 @@ fn transport_choice_is_fixed_for_session_lifetime() {
     };
     assert_eq!(
         Transport::from_config(&config).expect("default transport parses"),
-        Transport::WebSocket
+        Transport::Arrow
     );
 }
 

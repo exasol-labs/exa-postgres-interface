@@ -89,3 +89,13 @@ Date: 2026-05-21
 ## Review Findings
 
 <!-- Populated by speq-implement after code review. -->
+
+## Post-Implementation Addendum
+
+### [A1] Default transport flipped to Arrow (2026-05-28)
+
+- **Decision:** Change `DEFAULT_TRANSPORT` from `"websocket"` to `"arrow"`. The WebSocket transport remains fully supported and explicitly selectable via `exasol.transport = "websocket"`.
+- **Supersedes:** Decision [2] above ("Default transport is WebSocket").
+- **Rationale:** After completing the dual-transport work and verifying both paths against a live Exasol instance, the Arrow transport demonstrated the operational properties the gateway actually wants in the default path: fully async on Tokio, `RecordBatch` result handling with fewer string conversions, and parity on the test matrix. The "officially supported path as default" argument from decision [2] still has merit, but it weighed correctness/risk under the assumption that the Arrow path was unproven inside this gateway. With the dual-transport work verified PASS, that assumption no longer holds — the Arrow path is exercised by the same parameterised matrix as WebSocket. Operators who specifically need the WS JSON API can opt in with one config line.
+- **Scope of change:** one-line constant flip in `src/config.rs`, three test expectations updated, README + `config/example.toml` documentation updated, spec deltas updated. No code path changes; both transports were already implemented and tested.
+- **Promotes to ADR:** yes (replaces ADR derived from decision [2])

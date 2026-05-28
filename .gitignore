@@ -11,3 +11,4 @@ build/
 target/
 config/local.toml
 .codex
+demo/

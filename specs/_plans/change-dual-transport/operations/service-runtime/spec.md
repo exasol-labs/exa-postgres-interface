@@ -2,7 +2,7 @@
 
 The prototype SHOULD be installable as a long-running server process on Linux. The preferred operating model is a binary managed by systemd with external configuration and observable logs.
 
-The runtime SHALL connect to Exasol through a configurable transport. The operator SHALL choose between the officially supported Exasol WebSocket JSON API (default) and the experimental `exarrow-rs` Apache Arrow driver. TLS, certificate fingerprint validation, and the `NOCERTCHECK` escape hatch SHALL be configurable on the same surface the gateway has historically exposed, regardless of the selected transport.
+The runtime SHALL connect to Exasol through a configurable transport. The operator SHALL choose between the `exarrow-rs` Apache Arrow driver (default) and the officially supported Exasol WebSocket JSON API. TLS, certificate fingerprint validation, and the `NOCERTCHECK` escape hatch SHALL be configurable on the same surface the gateway has historically exposed, regardless of the selected transport.
 
 ## Background
 
@@ -32,7 +32,7 @@ The runtime SHALL connect to Exasol through a configurable transport. The operat
 <!-- DELTA:NEW -->
 ### Scenario: Operator selects the WebSocket transport
 
-* *GIVEN* the operator sets `exasol.transport = "websocket"` (or omits the field while `DEFAULT_TRANSPORT` equals `"websocket"`)
+* *GIVEN* the operator sets `exasol.transport = "websocket"`
 * *WHEN* the server starts and accepts a PostgreSQL client connection
 * *THEN* the gateway SHALL open the Exasol session using the WebSocket JSON transport
 * *AND* the gateway SHALL log the selected transport once at startup
@@ -43,7 +43,7 @@ The runtime SHALL connect to Exasol through a configurable transport. The operat
 <!-- DELTA:NEW -->
 ### Scenario: Operator selects the Arrow transport
 
-* *GIVEN* the operator sets `exasol.transport = "arrow"`
+* *GIVEN* the operator sets `exasol.transport = "arrow"` (or omits the field while `DEFAULT_TRANSPORT` equals `"arrow"`)
 * *WHEN* the server starts and accepts a PostgreSQL client connection
 * *THEN* the gateway SHALL open the Exasol session using the `exarrow-rs` Apache Arrow transport
 * *AND* the gateway SHALL log the selected transport once at startup

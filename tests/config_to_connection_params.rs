@@ -167,6 +167,6 @@ fn transport_unknown_rejects() {
 }
 
 #[test]
-fn default_transport_constant_is_websocket() {
-    assert_eq!(DEFAULT_TRANSPORT, "websocket");
+fn default_transport_constant_is_arrow() {
+    assert_eq!(DEFAULT_TRANSPORT, "arrow");
 }

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-pub const DEFAULT_TRANSPORT: &str = "websocket";
+pub const DEFAULT_TRANSPORT: &str = "arrow";
 
 fn default_transport() -> String {
     DEFAULT_TRANSPORT.to_owned()
@@ -204,13 +204,13 @@ mod tests {
     }
 
     #[test]
-    fn transport_defaults_to_websocket() {
+    fn transport_defaults_to_arrow() {
         let raw = "[exasol]\ndsn = \"127.0.0.1:8563\"\n";
         let config: AppConfig = toml::from_str(raw).unwrap();
         assert_eq!(config.exasol.transport, DEFAULT_TRANSPORT);
         assert_eq!(
             Transport::from_config(&config.exasol).unwrap(),
-            Transport::WebSocket
+            Transport::Arrow
         );
     }
 
