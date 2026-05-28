@@ -12,7 +12,7 @@ read-only policy with a capability-based read/write compatibility model.
 
 The protocol server SHALL provide the smallest PostgreSQL-compatible connection and query path needed for DbVisualizer to reach Exasol. The server SHALL preserve Exasol as the executing database and SHALL make unsupported PostgreSQL behavior explicit.
 
-The Exasol session SHALL communicate with Exasol through the `exarrow-rs` async driver. Result data SHALL be carried inside the gateway as Apache Arrow `RecordBatch` values until it is rendered into the PostgreSQL wire protocol response.
+The Exasol session SHALL communicate with Exasol through a configurable transport. The gateway SHALL carry result data in the shape native to the active transport: Apache Arrow `RecordBatch` values when the Arrow transport is active, and typed string-row results (with Exasol JSON-supplied column metadata) when the WebSocket transport is active. The wire-protocol mapping into PostgreSQL rows SHALL be defined for both shapes.
 
 The first supported statement scope is read-only DQL, but the protocol server SHOULD be designed as a session-oriented gateway that can add write-capable PostgreSQL behavior later without replacing the connection, authentication, session, or response-mapping architecture.
 
@@ -23,8 +23,9 @@ PostgreSQL wire compatibility SHALL be treated as a client integration layer ove
 * The client connects using a PostgreSQL-compatible client driver.
 * DbVisualizer is the first required client.
 * The protocol server opens an Exasol session for each accepted client session.
-* The Exasol session is provided by the `exarrow-rs` async driver and runs on the same Tokio runtime as the PostgreSQL wire-protocol server.
-* Exasol query results MUST cross the gateway as Apache Arrow `RecordBatch` values, not as pre-stringified rows.
+* The Exasol session is provided by one of two transports — the WebSocket JSON transport or the `exarrow-rs` Apache Arrow transport — selected at startup by `exasol.transport`.
+* Both transports run on the same Tokio runtime as the PostgreSQL wire-protocol server.
+* Both transports expose a uniform asynchronous session interface (`ExasolTransport`) inside the gateway, returning a transport-tagged outcome (`ExasolOutcome::ArrowRows`, `ExasolOutcome::TypedRows`, or `ExasolOutcome::RowCount`).
 * The first query scope is read-only DQL.
 * Future versions may support DML, DDL, transaction behavior, prepared statements, and richer metadata behavior.
 * PostgreSQL-compatible clients observe command completion tags, affected-row counts, errors, and transaction state in addition to result rows.
@@ -44,20 +45,21 @@ PostgreSQL wire compatibility SHALL be treated as a client integration layer ove
 ### Scenario: Client credentials are passed to Exasol
 
 * *GIVEN* the PostgreSQL client supplies a username and password during connection startup
-* *WHEN* the protocol server creates the Exasol session through the `exarrow-rs` driver
+* *WHEN* the protocol server creates the Exasol session through the configured transport
 * *THEN* the server SHALL use the client-supplied username and password to authenticate to Exasol
 * *AND* the server SHALL fail the client connection with a clear PostgreSQL-compatible error if Exasol rejects the credentials
 * *AND* the server SHALL NOT block a Tokio worker thread while waiting on Exasol authentication
+* *AND* the server SHALL authenticate identically whether the active transport is `websocket` or `arrow`
 
 
 ### Scenario: User runs the simplest smoke-test query
 
 * *GIVEN* the client has an active session through the protocol server
 * *WHEN* the user runs `SELECT 1`
-* *THEN* the server SHALL execute the query against Exasol through the `exarrow-rs` driver
-* *AND* the Exasol driver SHALL return the result as one or more Apache Arrow `RecordBatch` values
-* *AND* the server SHALL render the Arrow result into a PostgreSQL-compatible row description, data row, command completion, and ready state
+* *THEN* the server SHALL execute the query against Exasol through the configured transport
+* *AND* the server SHALL render the transport's result into a PostgreSQL-compatible row description, data row, command completion, and ready state
 * *AND* the result SHALL be visible to the client as a single row containing the value `1`
+* *AND* the observable client-side output SHALL be identical whether the active transport is `websocket` or `arrow`
 
 
 ### Scenario: User runs a read-only query against sample data
@@ -122,20 +124,33 @@ PostgreSQL wire compatibility SHALL be treated as a client integration layer ove
 * *AND* the server SHALL NOT claim full PostgreSQL transaction semantics until those semantics are implemented against Exasol
 
 
-### Scenario: Result values traverse the gateway as Apache Arrow record batches
+### Scenario: Result values traverse the gateway in the transport's native shape
 
 * *GIVEN* the client has an active session through the protocol server
 * *WHEN* the server executes any row-returning statement against Exasol
-* *THEN* the server SHALL hold the result inside the gateway as Apache Arrow `RecordBatch` values
-* *AND* the server SHALL render each Arrow column into a PostgreSQL field using a documented Arrow-to-PostgreSQL type mapping
-* *AND* the server SHALL encode NULL Arrow values as PostgreSQL NULLs in the data row
-* *AND* the server SHALL NOT introduce a pre-stringified row representation as an intermediate gateway data structure
+* *THEN* the server SHALL hold the result inside the gateway in the shape returned by the active transport without an intermediate re-encoding
+* *AND* the Arrow transport SHALL produce Apache Arrow `RecordBatch` values
+* *AND* the WebSocket transport SHALL produce typed string-row results carrying Exasol's JSON `dataType` metadata per column
+* *AND* the server SHALL render each shape into PostgreSQL fields using a documented per-transport type mapping
+* *AND* the server SHALL encode NULL values as PostgreSQL NULLs in the data row for both shapes
 
 
 ### Scenario: Exasol session calls are awaited on the Tokio runtime
 
 * *GIVEN* the gateway accepts a PostgreSQL client connection
 * *WHEN* the gateway opens an Exasol session, runs any session-initialization SQL, or executes a client statement
-* *THEN* the gateway SHALL drive each `exarrow-rs` call through `async`/`await` on the existing Tokio runtime
+* *THEN* the gateway SHALL drive each transport call through `async`/`await` on the existing Tokio runtime
 * *AND* the gateway MUST NOT wrap Exasol calls in `task::spawn_blocking` or `block_in_place`
 * *AND* the gateway SHALL guard the shared Exasol session with `tokio::sync::Mutex` so concurrent client requests serialize without poisoning a synchronous lock
+* *AND* the requirement SHALL hold for both the `websocket` and `arrow` transports
+
+
+### Scenario: WebSocket transport returns typed string rows with Exasol type OIDs
+
+* *GIVEN* the gateway is configured with `exasol.transport = "websocket"`
+* *AND* the client has an active session through the protocol server
+* *WHEN* the server executes a row-returning statement against Exasol
+* *THEN* the WebSocket transport SHALL parse Exasol's JSON result envelope into typed columns and string-row values
+* *AND* the gateway SHALL map each column's Exasol `dataType` metadata to a PostgreSQL type OID using the documented JSON-based OID mapping
+* *AND* the gateway SHALL emit each row to the client as PostgreSQL data rows whose field bytes are the string values returned by Exasol
+* *AND* the gateway SHALL encode JSON `null` column values as PostgreSQL NULLs
