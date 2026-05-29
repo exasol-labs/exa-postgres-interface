@@ -8,9 +8,7 @@ use arrow::array::{Array, AsArray, Decimal128Array, Int64Array, StringArray};
 use arrow::datatypes::DataType;
 use exa_postgres_interface::exasol::{ExasolOutcome, ExasolSession};
 
-use common::{
-    TEST_PASSWORD, TEST_USER, all_transport_configs, live_exasol_config_for_transport,
-};
+use common::{TEST_PASSWORD, TEST_USER, all_transport_configs, live_exasol_config_for_transport};
 
 /// Pull the first row, first column of a single-cell result back as a `String`
 /// by leaning on Arrow's built-in display utility. Tests use this to assert on
@@ -44,6 +42,42 @@ async fn client_credentials_authenticate_through_exarrow() {
     assert_eq!(first_cell_display(&outcome), "SYS");
 
     session.close().await.expect("close session");
+}
+
+#[tokio::test]
+#[ignore = "live exasol"]
+async fn empty_arrow_result_preserves_schema() {
+    // Empty result sets must still carry the Arrow schema so the gateway can
+    // build a PostgreSQL RowDescription. Regression test for the Qlik /
+    // pgAdmin NRE on empty getTables() responses.
+    let config = live_exasol_config_for_transport("arrow");
+    let mut session = ExasolSession::connect(&config, TEST_USER, TEST_PASSWORD)
+        .await
+        .expect("connect");
+
+    let outcome = session
+        .execute("SELECT 1 AS A, CAST('x' AS VARCHAR(10)) AS B WHERE 1 = 0")
+        .await
+        .expect("empty SELECT");
+
+    let batches = match outcome {
+        ExasolOutcome::ArrowRows(batches) => batches,
+        other => panic!("expected ArrowRows, got {other:?}"),
+    };
+
+    let batch = batches
+        .first()
+        .expect("an empty-row batch must still be present so the schema flows downstream");
+    assert_eq!(batch.num_rows(), 0, "no rows are expected");
+    assert_eq!(
+        batch.num_columns(),
+        2,
+        "schema columns A and B must survive"
+    );
+    assert_eq!(batch.schema().field(0).name(), "A");
+    assert_eq!(batch.schema().field(1).name(), "B");
+
+    session.close().await.expect("close");
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ A PostgreSQL wire-protocol gateway for Exasol. PostgreSQL-capable tools connect
 to the gateway; the gateway translates their SQL and metadata calls to Exasol
 and proxies the rest. Exasol remains the database engine.
 
-**Current release:** `v0.2.2` — see
+**Current release:** `v0.2.3` — see
 [Releases](https://github.com/exasol-labs/exa-postgres-interface/releases).
 
 The gateway talks to Exasol through the
@@ -26,8 +26,8 @@ curl -fsSL https://github.com/exasol-labs/exa-postgres-interface/releases/latest
 The installer drops the gateway under `/opt/exa-postgres-interface` when run as
 root, or `$HOME/.local/exa-postgres-interface` otherwise, and symlinks
 `/usr/local/bin/exa-postgres-interface` when running as root. Override the
-target with `INSTALL_PREFIX=/path INSTALL_VERSION=v0.2.2 sh` or pin to a
-specific release tag with `INSTALL_VERSION=v0.2.2`. Pass
+target with `INSTALL_PREFIX=/path INSTALL_VERSION=v0.2.3 sh` or pin to a
+specific release tag with `INSTALL_VERSION=v0.2.3`. Pass
 `INSTALL_NO_LAUNCH=1` to install without running the interactive bootstrap.
 
 ### Manual install (release tarball)
@@ -35,10 +35,10 @@ specific release tag with `INSTALL_VERSION=v0.2.2`. Pass
 If you'd rather drive the steps yourself:
 
 ```bash
-curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.2/exa-postgres-interface-v0.2.2-linux-x86_64.tar.gz
-curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.2/exa-postgres-interface-v0.2.2-linux-x86_64.tar.gz.sha256
-sha256sum -c exa-postgres-interface-v0.2.2-linux-x86_64.tar.gz.sha256
-tar -xzf exa-postgres-interface-v0.2.2-linux-x86_64.tar.gz
+curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.3/exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz
+curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.3/exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz.sha256
+sha256sum -c exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz.sha256
+tar -xzf exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz
 ```
 
 The archive contains the gateway binary, the `exasol_exec` SQL helper,
@@ -50,18 +50,18 @@ prompts for the listener and Exasol connection settings, writes the TOML, and
 offers to install the catalog compatibility objects:
 
 ```bash
-exa-postgres-interface-v0.2.2-linux-x86_64/bin/exa-postgres-interface \
+exa-postgres-interface-v0.2.3-linux-x86_64/bin/exa-postgres-interface \
   --config config/local.toml
 ```
 
 ### Non-interactive catalog install
 
 ```bash
-exa-postgres-interface-v0.2.2-linux-x86_64/bin/exasol_exec \
+exa-postgres-interface-v0.2.3-linux-x86_64/bin/exasol_exec \
   --dsn EXASOL_HOST:8563 \
   --user sys \
   --password 'EXASOL_PASSWORD' \
-  --file exa-postgres-interface-v0.2.2-linux-x86_64/sql/postgres_catalog_compatibility.sql
+  --file exa-postgres-interface-v0.2.3-linux-x86_64/sql/postgres_catalog_compatibility.sql
 ```
 
 ### Configuration
@@ -91,9 +91,9 @@ full reference.
 ### systemd
 
 ```bash
-sudo install -m 0755 exa-postgres-interface-v0.2.2-linux-x86_64/bin/exa-postgres-interface /opt/exa-postgres-interface/bin/exa-postgres-interface
-sudo install -m 0640 -o root -g exa-postgres-interface exa-postgres-interface-v0.2.2-linux-x86_64/config/example.toml /etc/exa-postgres-interface/config.toml
-sudo install -m 0644 exa-postgres-interface-v0.2.2-linux-x86_64/packaging/exa-postgres-interface.service /etc/systemd/system/exa-postgres-interface.service
+sudo install -m 0755 exa-postgres-interface-v0.2.3-linux-x86_64/bin/exa-postgres-interface /opt/exa-postgres-interface/bin/exa-postgres-interface
+sudo install -m 0640 -o root -g exa-postgres-interface exa-postgres-interface-v0.2.3-linux-x86_64/config/example.toml /etc/exa-postgres-interface/config.toml
+sudo install -m 0644 exa-postgres-interface-v0.2.3-linux-x86_64/packaging/exa-postgres-interface.service /etc/systemd/system/exa-postgres-interface.service
 sudo systemctl daemon-reload && sudo systemctl enable --now exa-postgres-interface
 ```
 
