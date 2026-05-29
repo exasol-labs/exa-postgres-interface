@@ -48,5 +48,8 @@ install -m 0644 "$ROOT/docs/smoke-test.md" "$STAGE_DIR/docs/smoke-test.md"
   sha256sum "$BINARY_NAME.tar.gz" > "$BINARY_NAME.tar.gz.sha256"
 )
 
+install -m 0755 "$ROOT/scripts/install.sh" "$DIST_DIR/install.sh"
+
 echo "$DIST_DIR/$BINARY_NAME.tar.gz"
 echo "$DIST_DIR/$BINARY_NAME.tar.gz.sha256"
+echo "$DIST_DIR/install.sh"

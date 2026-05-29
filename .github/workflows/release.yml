@@ -28,3 +28,4 @@ jobs:
           files: |
             dist/exa-postgres-interface-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/exa-postgres-interface-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
+            dist/install.sh

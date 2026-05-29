@@ -14,8 +14,25 @@ file to switch to the WebSocket JSON protocol instead.
 
 ## Install
 
-Download the Linux x86_64 release (built for `x86_64-unknown-linux-musl`, no
-glibc/OpenSSL dependency):
+One-step install on Linux x86_64 (downloads the latest release tarball,
+verifies the SHA256, unpacks it, and launches the interactive bootstrap that
+writes the config and installs the `PG_CATALOG`/`INFORMATION_SCHEMA`
+compatibility objects):
+
+```bash
+curl -fsSL https://github.com/exasol-labs/exa-postgres-interface/releases/latest/download/install.sh | sh
+```
+
+The installer drops the gateway under `/opt/exa-postgres-interface` when run as
+root, or `$HOME/.local/exa-postgres-interface` otherwise, and symlinks
+`/usr/local/bin/exa-postgres-interface` when running as root. Override the
+target with `INSTALL_PREFIX=/path INSTALL_VERSION=v0.2.0 sh` or pin to a
+specific release tag with `INSTALL_VERSION=v0.2.0`. Pass
+`INSTALL_NO_LAUNCH=1` to install without running the interactive bootstrap.
+
+### Manual install (release tarball)
+
+If you'd rather drive the steps yourself:
 
 ```bash
 curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.1/exa-postgres-interface-v0.2.1-linux-x86_64.tar.gz
@@ -28,11 +45,9 @@ The archive contains the gateway binary, the `exasol_exec` SQL helper,
 reference config, the systemd unit, the `PG_CATALOG`/`INFORMATION_SCHEMA`
 compatibility SQL, and key docs.
 
-### First run
-
-Start the gateway with a config path. If the file does not exist it prompts for
-the listener and Exasol connection settings, writes the TOML, and offers to
-install the catalog compatibility objects:
+Then start the gateway with a config path. If the file does not exist it
+prompts for the listener and Exasol connection settings, writes the TOML, and
+offers to install the catalog compatibility objects:
 
 ```bash
 exa-postgres-interface-v0.2.1-linux-x86_64/bin/exa-postgres-interface \
