@@ -5,7 +5,7 @@ to the gateway; the gateway translates their SQL and metadata calls to Exasol
 and proxies the rest. Exasol remains the database engine.
 
 **Current release:** `v0.2.0` — see
-[Releases](https://github.com/nconforti93/exa-postgres-interface/releases).
+[Releases](https://github.com/exasol-labs/exa-postgres-interface/releases).
 
 The gateway talks to Exasol through the
 [`exarrow-rs`](https://github.com/exasol-labs/exarrow-rs) Apache Arrow driver
@@ -18,8 +18,8 @@ Download the Linux x86_64 release (built for `x86_64-unknown-linux-musl`, no
 glibc/OpenSSL dependency):
 
 ```bash
-curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.2.0/exa-postgres-interface-v0.2.0-linux-x86_64.tar.gz
-curl -LO https://github.com/nconforti93/exa-postgres-interface/releases/download/v0.2.0/exa-postgres-interface-v0.2.0-linux-x86_64.tar.gz.sha256
+curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.0/exa-postgres-interface-v0.2.0-linux-x86_64.tar.gz
+curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.0/exa-postgres-interface-v0.2.0-linux-x86_64.tar.gz.sha256
 sha256sum -c exa-postgres-interface-v0.2.0-linux-x86_64.tar.gz.sha256
 tar -xzf exa-postgres-interface-v0.2.0-linux-x86_64.tar.gz
 ```
