@@ -839,6 +839,16 @@ fn rewrite_sqlglot_edge_cases(sql: &str) -> String {
             "(t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM PG_CATALOG.pg_class AS c WHERE c.oid = t.typrelid))",
             "(t.typrelid = 0)",
         )
+        // Beekeeper Studio emits the same pattern but without `AS c`. The
+        // correlated scalar subselect — `(SELECT c.relkind = 'c' FROM ...)`
+        // used as a boolean — is not supported by Exasol. Dropping the
+        // composite-type check (and keeping `t.typrelid = 0`) means we miss
+        // showing composite types; that's an acceptable approximation for
+        // metadata exploration in clients that just want a type list.
+        .replace(
+            "(t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM PG_CATALOG.pg_class c WHERE c.oid = t.typrelid))",
+            "(t.typrelid = 0)",
+        )
         .replace(
             "ON (C.TABLE_CATALOG, C.TABLE_SCHEMA, C.TABLE_NAME, 'TABLE', C.DTD_IDENTIFIER) = (E.OBJECT_CATALOG, E.OBJECT_SCHEMA, E.OBJECT_NAME, E.OBJECT_TYPE, E.DTD_IDENTIFIER)",
             "ON C.TABLE_CATALOG = E.OBJECT_CATALOG AND C.TABLE_SCHEMA = E.OBJECT_SCHEMA AND C.TABLE_NAME = E.OBJECT_NAME AND E.OBJECT_TYPE = 'TABLE' AND C.DTD_IDENTIFIER = E.DTD_IDENTIFIER",
@@ -1370,5 +1380,28 @@ WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
         // Should not contain double-quoting.
         assert!(!translated.contains("AS \"\"time\""));
         assert!(translated.contains("AS \"time\""));
+    }
+
+    #[test]
+    fn drops_correlated_scalar_subselect_in_beekeeper_pg_type_query() {
+        // Beekeeper Studio's type-list query embeds a scalar correlated
+        // subselect used as a boolean: `(SELECT c.relkind = 'c' FROM
+        // pg_class c WHERE c.oid = t.typrelid)`. Exasol rejects this kind of
+        // correlation. The rewrite collapses the whole disjunction to just
+        // `(t.typrelid = 0)` — see the comment in `rewrite_sqlglot_edge_cases`.
+        let sql = "SELECT n.nspname AS \"schema\", t.typname AS typename, \
+                   CAST(t.oid AS INT) AS typeid \
+                   FROM PG_CATALOG.PG_TYPE t \
+                   LEFT JOIN PG_CATALOG.pg_namespace n ON n.oid = t.typnamespace \
+                   WHERE (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM PG_CATALOG.pg_class c WHERE c.oid = t.typrelid)) \
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                   AND NOT EXISTS(SELECT 1 FROM PG_CATALOG.pg_type el WHERE el.oid = t.typelem AND el.typarray = t.oid)";
+        let translated = translate_postgres_to_exasol(sql).unwrap();
+        let lower = translated.to_ascii_lowercase();
+        assert!(
+            !lower.contains("c.relkind = 'c'"),
+            "scalar correlated subselect should have been removed; got: {translated}"
+        );
+        assert!(lower.contains("t.typrelid = 0"));
     }
 }
