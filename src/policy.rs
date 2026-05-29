@@ -94,8 +94,11 @@ impl StatementPlan {
 
 static COMMENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)/\*.*?\*/|--[^\n\r]*").unwrap());
+// Accepts both `SET key = value` and `SET key=value` (no spaces around `=`),
+// the latter being what pgAdmin emits for `SET DateStyle=ISO`. The trailing
+// `\S` keeps `SET key=` (missing value) from sneaking through.
 static SET_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^SET\s+(SESSION\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*(=|TO)\s+").unwrap()
+    Regex::new(r"(?i)^SET\s+(SESSION\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*(=|TO)\s*\S").unwrap()
 });
 static RESET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^RESET\s+(ALL|[A-Za-z_][A-Za-z0-9_.]*)$").unwrap());
@@ -958,6 +961,29 @@ mod tests {
         assert!(matches!(
             classify_statement("SHOW transaction isolation level"),
             StatementPlan::ClientShow { .. }
+        ));
+    }
+
+    #[test]
+    fn accepts_set_with_no_spaces_around_equals() {
+        // pgAdmin sends `SET DateStyle=ISO` on every connection; spaced and
+        // unspaced forms must both be swallowed locally.
+        assert_eq!(
+            classify_statement("SET DateStyle=ISO"),
+            StatementPlan::ClientSet
+        );
+        assert_eq!(
+            classify_statement("SET DateStyle = ISO"),
+            StatementPlan::ClientSet
+        );
+        assert_eq!(
+            classify_statement("SET client_min_messages='warning'"),
+            StatementPlan::ClientSet
+        );
+        // Missing value still rejected.
+        assert!(matches!(
+            classify_statement("SET DateStyle="),
+            StatementPlan::Reject { .. }
         ));
     }
 

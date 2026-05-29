@@ -267,13 +267,15 @@ pub fn translate_postgres_to_exasol(sql: &str) -> Result<String, TranslationErro
     let sql = strip_exasol_catalog_prefix(sql);
     let sql = sql.as_str();
     if is_exasol_passthrough_sql(sql) {
-        return Ok(sql.to_owned());
+        return Ok(quote_reserved_aliases(sql));
     }
 
     let normalized = normalize_ansi_quoted_postgres_identifiers(sql);
     let known_metadata_query = rewrite_known_metadata_query(&normalized);
     if known_metadata_query != normalized {
-        return Ok(rewrite_ilike(&known_metadata_query));
+        return Ok(quote_reserved_aliases(&rewrite_ilike(
+            &known_metadata_query,
+        )));
     }
 
     let rewritten = rewrite_pg_catalog(&normalized);
@@ -281,7 +283,7 @@ pub fn translate_postgres_to_exasol(sql: &str) -> Result<String, TranslationErro
         .map_err(|err| TranslationError::new(err.to_string()))?
         .join("; ");
     let translated = rewrite_sqlglot_edge_cases(&translated);
-    Ok(rewrite_ilike(&translated))
+    Ok(quote_reserved_aliases(&rewrite_ilike(&translated)))
 }
 
 fn is_exasol_passthrough_sql(sql: &str) -> bool {
@@ -949,6 +951,72 @@ fn rewrite_quote_ident(sql: &str) -> String {
         .to_string()
 }
 
+// Exasol reserved words that PostgreSQL clients commonly emit as bare column
+// aliases. Grafana's `AS time`, JDBC drivers' `AS schema`, hand-written
+// `AS value`, etc. all parse fine in PostgreSQL but blow up in Exasol because
+// the unquoted identifier collides with a reserved keyword. We don't try to
+// quote every Exasol reserved word — just the ones that show up as aliases in
+// real client traffic. Lowercase entries; comparison is case-insensitive.
+static RESERVED_ALIAS_WORDS: LazyLock<std::collections::HashSet<&'static str>> =
+    LazyLock::new(|| {
+        [
+            "action",
+            "column",
+            "current",
+            "date",
+            "default",
+            "group",
+            "key",
+            "level",
+            "order",
+            "partition",
+            "range",
+            "schema",
+            "session",
+            "size",
+            "statement",
+            "table",
+            "time",
+            "user",
+            "value",
+            "zone",
+        ]
+        .into_iter()
+        .collect()
+    });
+
+// Matches `AS <ident>` plus any trailing whitespace and an optional `)`. The
+// trailing group is how we tell aliases (`SELECT x AS time FROM ...`) from
+// cast type arguments (`CAST(x AS DATE)`): if the capture ends in `)`, we're
+// inside a CAST and must leave the identifier alone. (Rust's `regex` crate
+// has no lookahead, so we capture instead of peeking.)
+static ALIAS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bAS\s+([A-Za-z_][A-Za-z0-9_]*)(\s*\)?)").unwrap());
+
+/// Quote any `AS <ident>` whose identifier is an Exasol reserved word.
+///
+/// Applied to both passthrough and translated SQL so a hand-written
+/// `SELECT 1 AS time` and a translated `SELECT CURRENT_SCHEMA AS schema` are
+/// both made safe before being sent to Exasol.
+fn quote_reserved_aliases(sql: &str) -> String {
+    ALIAS_RE
+        .replace_all(sql, |cap: &Captures| {
+            let whole = cap.get(0).map(|m| m.as_str()).unwrap_or("");
+            let ident = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let trailing = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if trailing.contains(')') {
+                // CAST(... AS TYPE) — leave the type argument alone.
+                return whole.to_owned();
+            }
+            if RESERVED_ALIAS_WORDS.contains(ident.to_ascii_lowercase().as_str()) {
+                format!("AS \"{ident}\"{trailing}")
+            } else {
+                whole.to_owned()
+            }
+        })
+        .to_string()
+}
+
 fn rewrite_ilike(sql: &str) -> String {
     ILIKE_RE
         .replace_all(sql, "UPPER($1) LIKE UPPER($2)")
@@ -1249,5 +1317,58 @@ WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
         assert!(translated.to_ascii_uppercase().contains("CURRENT_SCHEMA"));
         assert!(!translated.contains("current_schema("));
         assert!(!translated.to_ascii_uppercase().contains("CURRENT_SCHEMA("));
+    }
+
+    #[test]
+    fn quotes_reserved_word_aliases_after_as() {
+        // Beekeeper sends `SELECT CURRENT_SCHEMA() AS schema` on connect;
+        // SCHEMA is reserved in Exasol so the unquoted alias must be quoted.
+        let translated = translate_postgres_to_exasol("SELECT CURRENT_SCHEMA() AS schema").unwrap();
+        assert!(translated.contains("AS \"schema\""));
+
+        // Common Grafana / hand-written patterns.
+        assert!(
+            translate_postgres_to_exasol("SELECT 1 AS time FROM dual")
+                .unwrap()
+                .contains("AS \"time\"")
+        );
+        assert!(
+            translate_postgres_to_exasol("SELECT 1 AS value")
+                .unwrap()
+                .contains("AS \"value\"")
+        );
+    }
+
+    #[test]
+    fn alias_quoting_does_not_touch_cast_type_argument() {
+        // `CAST(x AS DATE)` and `x::DATE` are type casts, not aliases.
+        // DATE is in the reserved set but must NOT be quoted inside a cast.
+        let translated =
+            translate_postgres_to_exasol("SELECT CAST(ORDER_TS AS DATE) AS d FROM orders").unwrap();
+        let upper = translated.to_ascii_uppercase();
+        assert!(upper.contains("AS DATE)"));
+        assert!(!translated.contains("AS \"DATE\")"));
+        assert!(!translated.contains("AS \"date\")"));
+    }
+
+    #[test]
+    fn alias_quoting_skips_non_reserved_aliases() {
+        // `revenue`, `customer`, `region` are not reserved in Exasol — leave them.
+        let translated =
+            translate_postgres_to_exasol("SELECT amount AS revenue, name AS customer FROM orders")
+                .unwrap();
+        assert!(translated.contains("AS revenue"));
+        assert!(translated.contains("AS customer"));
+        assert!(!translated.contains("AS \"revenue\""));
+    }
+
+    #[test]
+    fn alias_quoting_preserves_already_quoted_aliases() {
+        // `AS "time"` is already valid; the regex requires an unquoted start
+        // so it should be left alone.
+        let translated = translate_postgres_to_exasol("SELECT 1 AS \"time\"").unwrap();
+        // Should not contain double-quoting.
+        assert!(!translated.contains("AS \"\"time\""));
+        assert!(translated.contains("AS \"time\""));
     }
 }
