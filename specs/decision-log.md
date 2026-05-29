@@ -200,3 +200,112 @@ Specify (but defer implementing) a per-tool baseline-promotion mechanism: `tests
 ### Consequences
 
 Tool-specific regressions are visible in CI independently of the global must-pass gate. The baseline files are plain text and reviewable in pull requests. The `add-per-tool-baseline-promotion` follow-up plan has a concrete file-path contract and report-classification contract to implement against.
+
+---
+
+## ADR-008: Adopt exarrow-rs as the Exasol transport
+
+**Date:** 2026-05-18
+**Plan:** `change-exarrow-transport`
+**Status:** Accepted
+
+### Context
+
+The gateway used a hand-rolled transport stack built on `tungstenite` + JSON + RSA login in `src/exasol.rs`. This bespoke implementation required maintaining ~400 lines of protocol code and four runtime dependencies (`tungstenite`, `native-tls`, `rsa`, `sha2`, plus `base64`). Exasol Labs publishes and maintains `exarrow-rs`, an async Tokio driver that returns Apache Arrow `RecordBatch` values directly and supports certificate fingerprint pinning natively via `rustls` + `aws-lc-rs`.
+
+### Decision
+
+Replace the hand-rolled transport in `src/exasol.rs` with `exarrow-rs = "0.12"`, using its native TCP transport (`features = ["native"]`).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Adopt `exarrow-rs` | Chosen — deletes ~400 lines of bespoke protocol code, removes four runtime dependencies, gains async Arrow results and native fingerprint pinning |
+| Keep existing transport and retype results to `RecordBatch` | Rejected — leaves `rsa`, `native-tls`, and the manual protocol loop in place; gives up the maintenance win |
+| Build a thin in-tree async WebSocket client on `tokio-tungstenite` plus custom Arrow decoder | Rejected — Exasol Labs already ships and maintains `exarrow-rs`; re-implementing it is gratuitous |
+
+### Consequences
+
+The bespoke protocol loop and its dependencies are deleted. Certificate fingerprint validation continues to work through `exarrow-rs` `ConnectionParams`. Future transport improvements track the `exarrow-rs` upstream release cadence rather than in-tree maintenance.
+
+---
+
+## ADR-009: Propagate Arrow RecordBatch through pg_server.rs
+
+**Date:** 2026-05-18
+**Plan:** `change-exarrow-transport`
+**Status:** Accepted
+
+### Context
+
+The existing `GatewayResponse::TypedQuery` variant carried `rows: Vec<Vec<Option<String>>>` — pre-stringified values produced inside `src/exasol.rs`. With `exarrow-rs` returning `RecordBatch` values, the team had to decide how far Arrow propagation should go before converting to strings.
+
+### Decision
+
+Replace `GatewayResponse::TypedQuery { columns, rows: Vec<Vec<Option<String>>>, command_tag }` with `GatewayResponse::ArrowQuery { schema: arrow::datatypes::SchemaRef, batches: Vec<RecordBatch>, command_tag }`. Arrow values are rendered into pgwire's `DataRowEncoder` at the wire-protocol boundary. The cursor registry stores `Vec<RecordBatch>` instead of pre-stringified rows.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Full Arrow propagation to the wire boundary | Chosen — matches explicit user intent ("full propagation, no adapter shim"); gives one central Arrow-to-pgwire renderer to maintain |
+| Convert Arrow batches to `Vec<Vec<Option<String>>>` inside `src/exasol.rs` | Rejected — forces a value-by-value `String` round-trip and loses the throughput benefit |
+
+### Consequences
+
+A single Arrow-to-pgwire renderer handles all result-returning paths. The cursor registry carries typed Arrow data rather than strings, enabling future columnar optimizations. The metadata builder paths that synthesise PostgreSQL catalog rows retain a text-row helper (`arrow_batches_to_text_rows`) as a scoped exception pending a separate metadata-builder rewrite.
+
+---
+
+## ADR-010: Use exarrow-rs built-in fingerprint and validation parameters
+
+**Date:** 2026-05-18
+**Plan:** `change-exarrow-transport`
+**Status:** Accepted
+
+### Context
+
+The existing configuration supported `certificate_fingerprint`, `validate_certificate`, and a DSN-embedded fingerprint suffix with a defined precedence rule. After adopting `exarrow-rs`, the team needed to decide whether to translate these directly into `ConnectionParams` or to build a custom `rustls::ServerCertVerifier`.
+
+### Decision
+
+Translate `ExasolConfig.certificate_fingerprint`, `validate_certificate`, and the DSN-embedded fingerprint suffix directly into `exarrow_rs::ConnectionParams { certificate_fingerprint, validate_server_certificate, use_tls, ... }`. Preserve the existing precedence rule from `Endpoint::parse` (explicit config field wins over DSN suffix; `validate_certificate = false` with no fingerprint maps to `validate_server_certificate = false`).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Translate config fields directly into `ConnectionParams` | Chosen — lowest-friction way to preserve every existing configuration knob without forking driver internals |
+| Build a custom `rustls::ServerCertVerifier` injected via an `exarrow-rs` extension hook | Rejected — `ConnectionParams` already accepts the fingerprint and validation flag; reimplementing the verifier locks into `exarrow-rs` internals |
+
+### Consequences
+
+All existing certificate validation configuration knobs continue to work without behavioral change. The precedence rule is preserved in one place (`Endpoint::parse`). No internal `exarrow-rs` APIs are forked.
+
+---
+
+## ADR-011: Replace std::sync::Mutex with tokio::sync::Mutex around the Exasol session
+
+**Date:** 2026-05-18
+**Plan:** `change-exarrow-transport`
+**Status:** Accepted
+
+### Context
+
+`SessionState.exasol` previously used `std::sync::Mutex<ExasolSession>`. The new async `execute` call on `exarrow-rs` requires awaiting the driver while the session lock is held. A `std::sync::Mutex` guard cannot be held across `.await` points without risking deadlocks or requiring `block_in_place`.
+
+### Decision
+
+Change `SessionState.exasol` to `tokio::sync::Mutex<ExasolSession>`. The cursor registry, extended-query result cache, and current-schema cell also move to `tokio::sync::Mutex` for consistency and to eliminate lock-poisoning handling.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Use `tokio::sync::Mutex` throughout `SessionState` | Chosen — the canonical fix for holding a lock across `.await`; eliminates lock-poisoning handling |
+| Keep `std::sync::Mutex` and wrap `exarrow-rs` calls in `task::spawn_blocking` | Rejected — explicitly excluded by the design interview ("no `block_in_place`"); adds unnecessary thread hops |
+
+### Consequences
+
+All session-state locking is async-safe. Lock-poisoning error handling is removed. Every call site that previously used `std::sync::MutexGuard` is updated to await the async lock. The bootstrap path drives async session calls through `handle.block_on(...)` to keep terminal I/O synchronous.

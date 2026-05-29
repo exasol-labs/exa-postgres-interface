@@ -20,6 +20,10 @@ encryption = true
 validate_certificate = true
 pass_client_credentials = true
 schema = ""
+# Data-transport backend used to talk to Exasol. "arrow" (default) uses the
+# exarrow-rs Apache Arrow driver; "websocket" uses the hand-rolled WebSocket
+# JSON protocol. The choice is fixed at startup.
+# transport = "arrow"
 
 [translation]
 enabled = true

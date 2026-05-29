@@ -141,7 +141,7 @@ BEGIN
                 || ')'
         WHEN TYPE_OID = 1700 THEN 'numeric'
         WHEN TYPE_OID = 2249 THEN 'record'
-        ELSE '???'
+        ELSE 'unknown'
     END;
 END FORMAT_TYPE;
 /
