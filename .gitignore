@@ -12,3 +12,6 @@ target/
 config/local.toml
 .codex
 demo/
+# Keep the README demo video tracked
+!demo/
+!demo/demo.mp4

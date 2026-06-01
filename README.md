@@ -1,109 +1,71 @@
-# PostgreSQL Gateway for Exasol
+<div align="center">
 
-A PostgreSQL wire-protocol gateway for Exasol. PostgreSQL-capable tools connect
-to the gateway; the gateway translates their SQL and metadata calls to Exasol
-and proxies the rest. Exasol remains the database engine.
+<img src="assets/exa-postgres-interface-logo.svg" alt="exa-postgres-interface logo" width="380">
 
-**Current release:** `v0.2.3` — see
-[Releases](https://github.com/exasol-labs/exa-postgres-interface/releases).
+# exa-postgres-interface
 
-The gateway talks to Exasol through the
-[`exarrow-rs`](https://github.com/exasol-labs/exarrow-rs) Apache Arrow driver
-by default. If needed, set `exasol.transport = "websocket"` in the config
-file to switch to the WebSocket JSON protocol instead.
+**A PostgreSQL wire-protocol gateway for Exasol.**
 
-## Install
+[![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
+[![Release](https://img.shields.io/github/v/release/exasol-labs/exa-postgres-interface?sort=semver)](https://github.com/exasol-labs/exa-postgres-interface/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![spec|driven](https://img.shields.io/badge/spec-driven-blue)](./specs/)
 
-One-step install on Linux x86_64 (downloads the latest release tarball,
-verifies the SHA256, unpacks it, and launches the interactive bootstrap that
-writes the config and installs the `PG_CATALOG`/`INFORMATION_SCHEMA`
-compatibility objects):
+</div>
+
+https://github.com/exasol-labs/exa-postgres-interface/raw/main/demo/demo.mp4
+
+> Don't see the video? [Watch the demo](demo/demo.mp4).
+
+## What it solves
+
+Several tools, BI platforms, or applications speak PostgreSQL but have no
+native Exasol connector. `exa-postgres-interface` lets them connect to Exasol
+**using an ordinary PostgreSQL driver** — no Exasol-specific client required.
+
+PostgreSQL-capable clients connect to the gateway; the gateway translates their
+SQL and metadata calls into Exasol's dialect and proxies the rest. Exasol
+remains the database engine — it still owns SQL execution, storage, privileges,
+and transaction semantics. The gateway only speaks the PostgreSQL wire protocol
+on the client's behalf.
+
+```
+PostgreSQL client  ──Postgres wire──▶  exa-postgres-interface  ──Arrow/WebSocket──▶  Exasol
+ (psql, JDBC, BI)                          (translation + proxy)                      (engine)
+```
+
+By default the gateway talks to Exasol through the
+[`exarrow-rs`](https://github.com/exasol-labs/exarrow-rs) Apache Arrow driver;
+set `exasol.transport = "websocket"` to use the WebSocket JSON protocol instead.
+
+## Quick Start
+
+> **Open port `15432`** on the host running the gateway (and any firewall or
+> cloud security group in front of it) so PostgreSQL clients can connect.
+
+### 1. Install
+
+One-step install on Linux x86_64 — downloads the latest release, verifies its
+SHA256, unpacks it, and launches an interactive bootstrap that writes the config
+and installs the `PG_CATALOG`/`INFORMATION_SCHEMA` compatibility objects in
+Exasol:
 
 ```bash
 curl -fsSL https://github.com/exasol-labs/exa-postgres-interface/releases/latest/download/install.sh | sh
 ```
 
-The installer drops the gateway under `/opt/exa-postgres-interface` when run as
-root, or `$HOME/.local/exa-postgres-interface` otherwise, and symlinks
-`/usr/local/bin/exa-postgres-interface` when running as root. Override the
-target with `INSTALL_PREFIX=/path INSTALL_VERSION=v0.2.3 sh` or pin to a
-specific release tag with `INSTALL_VERSION=v0.2.3`. Pass
-`INSTALL_NO_LAUNCH=1` to install without running the interactive bootstrap.
+The bootstrap asks for the listener settings and your Exasol connection
+details, then starts the gateway listening on `15432`.
 
-### Manual install (release tarball)
+> Manual tarball installs, the non-interactive catalog setup, the full
+> configuration reference, and running as a **systemd** service are covered in
+> the **[Installation guide](docs/installation.md)**.
 
-If you'd rather drive the steps yourself:
+### 2. Connect
 
-```bash
-curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.3/exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz
-curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.3/exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz.sha256
-sha256sum -c exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz.sha256
-tar -xzf exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz
-```
-
-The archive contains the gateway binary, the `exasol_exec` SQL helper,
-reference config, the systemd unit, the `PG_CATALOG`/`INFORMATION_SCHEMA`
-compatibility SQL, and key docs.
-
-Then start the gateway with a config path. If the file does not exist it
-prompts for the listener and Exasol connection settings, writes the TOML, and
-offers to install the catalog compatibility objects:
-
-```bash
-exa-postgres-interface-v0.2.3-linux-x86_64/bin/exa-postgres-interface \
-  --config config/local.toml
-```
-
-### Non-interactive catalog install
-
-```bash
-exa-postgres-interface-v0.2.3-linux-x86_64/bin/exasol_exec \
-  --dsn EXASOL_HOST:8563 \
-  --user sys \
-  --password 'EXASOL_PASSWORD' \
-  --file exa-postgres-interface-v0.2.3-linux-x86_64/sql/postgres_catalog_compatibility.sql
-```
-
-### Configuration
-
-Minimal TOML:
-
-```toml
-[server]
-listen_host = "0.0.0.0"
-listen_port = 15432
-log_level = "INFO"
-
-[exasol]
-dsn = "EXASOL_HOST:8563"
-encryption = true
-pass_client_credentials = true
-certificate_fingerprint = "SHA256_HEX_FINGERPRINT"
-
-[translation]
-enabled = true
-```
-
-Optional PostgreSQL listener TLS: set `server.tls_cert_path` and
-`server.tls_key_path`. See [config/example.toml](config/example.toml) for the
-full reference.
-
-### systemd
-
-```bash
-sudo install -m 0755 exa-postgres-interface-v0.2.3-linux-x86_64/bin/exa-postgres-interface /opt/exa-postgres-interface/bin/exa-postgres-interface
-sudo install -m 0640 -o root -g exa-postgres-interface exa-postgres-interface-v0.2.3-linux-x86_64/config/example.toml /etc/exa-postgres-interface/config.toml
-sudo install -m 0644 exa-postgres-interface-v0.2.3-linux-x86_64/packaging/exa-postgres-interface.service /etc/systemd/system/exa-postgres-interface.service
-sudo systemctl daemon-reload && sudo systemctl enable --now exa-postgres-interface
-```
-
-The service uses `--no-bootstrap`; run the interactive bootstrap or the
-non-interactive catalog install once before enabling.
-
-## Connect
-
-Use any PostgreSQL driver. Host = gateway, port `15432`, database `exasol`,
-user/password = Exasol credentials.
+Connect to the gateway using your PostgreSQL driver and your Exasol
+credentials. Point it at the gateway host on port `15432`, database `exasol`,
+with your Exasol username and password:
 
 ```bash
 PGPASSWORD='EXASOL_PASSWORD' psql -h GATEWAY_HOST -p 15432 -U sys -d exasol -c 'SELECT 1;'
@@ -112,6 +74,8 @@ PGPASSWORD='EXASOL_PASSWORD' psql -h GATEWAY_HOST -p 15432 -U sys -d exasol -c '
 ```text
 jdbc:postgresql://GATEWAY_HOST:15432/exasol?preferQueryMode=extended
 ```
+
+That's it — your PostgreSQL-speaking tool is now querying Exasol.
 
 ## Compatibility
 
@@ -125,12 +89,26 @@ Unsupported by design: `COPY`, `EXPLAIN`/`ANALYZE`/`VACUUM`, savepoints,
 `LOCK TABLE`, extensions, publications, text-search objects, and other
 PostgreSQL engine-specific features that lack an Exasol equivalent.
 
-Full matrix and details:
+Clients exercised in the compatibility suite include `psql`, JDBC,
+DBeaver, DbVisualizer, Qlik, and Metabase. Full details:
 
 * [docs/compatibility-matrix.md](docs/compatibility-matrix.md)
 * [docs/postgres-metadata-compatibility.md](docs/postgres-metadata-compatibility.md)
 * [docs/client-compatibility-test-framework.md](docs/client-compatibility-test-framework.md)
 * [docs/smoke-test.md](docs/smoke-test.md)
+
+## Performance
+
+The gateway adds modest, predictable overhead versus a direct Exasol JDBC
+connection:
+
+* **~140–155 ms** fixed cost per small query,
+* **1.11–1.38×** direct-JDBC time on 1M–10M row transfers,
+* **near-parity** once Exasol execution time dominates.
+
+Re-benchmark in your own environment with
+`scripts/run_gateway_vs_exasol_benchmark.sh` before treating any of these
+numbers as acceptance criteria.
 
 ## Development
 
@@ -171,11 +149,3 @@ Releases are produced by [scripts/package_release.sh](scripts/package_release.sh
 and the GitHub Actions workflow that fires on `v*` tags. The script defaults
 to `x86_64-unknown-linux-musl`; pass `TARGET_TRIPLE=x86_64-unknown-linux-gnu`
 on hosts without the musl cross-toolchain.
-
-## Performance
-
-Measurable overhead vs. a direct Exasol JDBC connection: roughly `140–155 ms`
-fixed cost per small query, `1.11–1.38x` direct-JDBC time on 1M–10M row
-transfers, and near-parity once Exasol execution time dominates. Re-benchmark
-in your target environment with `scripts/run_gateway_vs_exasol_benchmark.sh`
-before treating any of these numbers as acceptance criteria.
