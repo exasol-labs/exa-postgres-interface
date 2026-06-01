@@ -13,7 +13,7 @@
 
 </div>
 
-https://github.com/exasol-labs/exa-postgres-interface/raw/main/demo/demo.mp4
+https://github.com/user-attachments/assets/1d7e84f3-eae8-4ca9-af44-000db7eaa1f0
 
 > Don't see the video? [Watch the demo](demo/demo.mp4).
 
