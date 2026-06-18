@@ -643,6 +643,20 @@ fn local_select(sql: &str) -> Option<StatementPlan> {
     if lower == "select current_user" || lower == "select user" {
         return Some(single_value("current_user", "sys"));
     }
+    // Beekeeper (and other clients) call pg_backend_pid() to label the
+    // connection. Exasol has no such function, so it errors if the call
+    // reaches the engine. Answer locally with a synthetic, stable value and
+    // honor the client's alias when present (e.g. `... AS pid`).
+    if lower == "select pg_backend_pid()" || lower.starts_with("select pg_backend_pid() as ") {
+        // No FROM clause here, so select_alias() can't help; take the alias
+        // straight from the matched `... AS <name>` suffix.
+        let name = lower
+            .find(" as ")
+            .map(|idx| unquote_identifier(&sql[idx + 4..]))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "pg_backend_pid".to_owned());
+        return Some(single_value(&name, "1"));
+    }
     None
 }
 
@@ -993,6 +1007,23 @@ mod tests {
             classify_statement("SELECT version()"),
             StatementPlan::ClientSelect { .. }
         ));
+    }
+
+    #[test]
+    fn answers_pg_backend_pid_locally() {
+        // Exasol has no pg_backend_pid(); the gateway must answer it without a
+        // round-trip and preserve the client's alias.
+        assert!(matches!(
+            classify_statement("SELECT pg_backend_pid()"),
+            StatementPlan::ClientSelect { .. }
+        ));
+        match classify_statement("SELECT pg_backend_pid() AS pid") {
+            StatementPlan::ClientSelect { columns, rows } => {
+                assert_eq!(columns, vec!["pid".to_owned()]);
+                assert_eq!(rows, vec![vec![Some("1".to_owned())]]);
+            }
+            other => panic!("expected ClientSelect, got {other:?}"),
+        }
     }
 
     #[test]
