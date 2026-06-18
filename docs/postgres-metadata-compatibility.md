@@ -198,3 +198,16 @@ scripts/run_jdbc_compatibility_suite.sh \
   strings, not PostgreSQL `pg_get_*` exact output.
 * New PostgreSQL clients may issue additional catalog SQL shapes that need
   preprocessor mappings even when the underlying catalog views already exist.
+* **`reg*` OID casts are not generally translated (known issue).** Expressions
+  like `<oid>::regnamespace::text`, `<oid>::regclass::text`, or
+  `<oid>::regtype::text` transpile to `CAST(... AS REGNAMESPACE/REGCLASS/REGTYPE)`,
+  which Exasol rejects (`syntax error, unexpected IDENTIFIER_PART_`) because it
+  has no such types. Today these only work where a specific client query is
+  intercepted in `rewrite_known_metadata_query` (e.g. Beekeeper Studio's table
+  list). A general fix would rewrite the post-sqlglot `CAST(CAST(<expr> AS
+  REGNAMESPACE) AS LONG VARCHAR)` form into a catalog name lookup such as
+  `(SELECT NSPNAME FROM PG_CATALOG.PG_NAMESPACE WHERE OID = <expr>)` (and the
+  PG_CLASS / PG_TYPE equivalents). The risk is that this produces a correlated
+  scalar subquery, which Exasol rejects in some positions — see the `pg_type`
+  composite-type workaround in `rewrite_sqlglot_edge_cases` — so it needs
+  validation against a live Exasol before shipping.

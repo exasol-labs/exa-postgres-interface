@@ -733,6 +733,36 @@ WHERE 1 = 0
         .to_owned();
     }
 
+    // Beekeeper Studio's table-list query joins information_schema.tables to
+    // pg_class (to read relkind) and self-joins through pg_inherits to find a
+    // partition/inheritance parent. The join predicate casts the namespace OID
+    // with `relnamespace::regnamespace::text`, which sqlglot renders as
+    // `CAST(... AS REGNAMESPACE)` — a type Exasol doesn't have, so it fails to
+    // parse. Even with that cast fixed, the pg_inherits self-join has no
+    // meaning on Exasol (no table inheritance or partitioning), so this query
+    // can only be answered by recognizing its intent, not by rewriting its
+    // expressions. We match on that structural signature — tables view +
+    // pg_inherits + relkind — rather than the client's exact column aliases,
+    // so alias/whitespace/casing variants still resolve. Every base table is an
+    // ordinary table (relkind 'r') with no parent, sourced from
+    // SYS.EXA_ALL_TABLES (tables only — views are excluded, matching the
+    // original `table_type NOT LIKE '%VIEW%'` filter).
+    if normalized.contains("information_schema.tables")
+        && normalized.contains("pg_inherits")
+        && normalized.contains("relkind")
+    {
+        return concat!(
+            "SELECT\n",
+            "    TABLE_SCHEMA AS \"schema\",\n",
+            "    TABLE_NAME AS \"name\",\n",
+            "    'r' AS \"tabletype\",\n",
+            "    CAST(NULL AS CHAR(1)) AS \"parenttype\"\n",
+            "FROM SYS.EXA_ALL_TABLES\n",
+            "ORDER BY TABLE_SCHEMA, TABLE_NAME"
+        )
+        .to_owned();
+    }
+
     sql.to_owned()
 }
 
@@ -1380,6 +1410,58 @@ WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
         // Should not contain double-quoting.
         assert!(!translated.contains("AS \"\"time\""));
         assert!(translated.contains("AS \"time\""));
+    }
+
+    #[test]
+    fn rewrites_beekeeper_table_list_with_inheritance_query() {
+        // Beekeeper Studio sends this on connect to populate its table tree.
+        // The `relnamespace::regnamespace::text` cast becomes an invalid
+        // `CAST(... AS REGNAMESPACE)` in Exasol, so the gateway must answer it
+        // from a native catalog query instead.
+        let sql = "SELECT
+        t.table_schema as schema,
+        t.table_name as name,
+          pc.relkind as tabletype,
+          parent_pc.relkind as parenttype
+        FROM information_schema.tables AS t
+        JOIN pg_class AS pc
+          ON t.table_name = pc.relname AND quote_ident(t.table_schema) = pc.relnamespace::regnamespace::text
+        LEFT OUTER JOIN pg_inherits AS i
+          ON pc.oid = i.inhrelid
+        LEFT OUTER JOIN pg_class AS parent_pc
+          ON parent_pc.oid = i.inhparent
+        WHERE t.table_type NOT LIKE '%VIEW%'
+      ORDER BY t.table_schema, t.table_name";
+        let translated = translate_postgres_to_exasol(sql).unwrap();
+        let upper = translated.to_ascii_uppercase();
+        // No invalid REGNAMESPACE cast survives.
+        assert!(!upper.contains("REGNAMESPACE"), "got: {translated}");
+        // Answered from the Exasol catalog with the columns Beekeeper expects.
+        assert!(upper.contains("FROM SYS.EXA_ALL_TABLES"), "got: {translated}");
+        assert!(translated.contains("AS \"schema\""));
+        assert!(translated.contains("AS \"name\""));
+        assert!(translated.contains("AS \"tabletype\""));
+        assert!(translated.contains("AS \"parenttype\""));
+
+        // The match is on the structural signature (tables view + pg_inherits +
+        // relkind), not the client's exact aliases, so a variant that renames
+        // the aliases and table-correlation names still resolves.
+        let variant = "SELECT c.table_schema AS s, c.table_name AS n,
+              k.relkind AS kind, p.relkind AS parentkind
+            FROM information_schema.tables AS c
+            JOIN pg_class AS k ON c.table_name = k.relname
+              AND quote_ident(c.table_schema) = k.relnamespace::regnamespace::text
+            LEFT OUTER JOIN pg_inherits AS h ON k.oid = h.inhrelid
+            LEFT OUTER JOIN pg_class AS p ON p.oid = h.inhparent
+            WHERE c.table_type NOT LIKE '%VIEW%'";
+        let translated_variant = translate_postgres_to_exasol(variant).unwrap();
+        assert!(!translated_variant.to_ascii_uppercase().contains("REGNAMESPACE"));
+        assert!(
+            translated_variant
+                .to_ascii_uppercase()
+                .contains("FROM SYS.EXA_ALL_TABLES"),
+            "got: {translated_variant}"
+        );
     }
 
     #[test]
