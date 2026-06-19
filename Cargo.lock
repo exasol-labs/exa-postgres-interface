@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "exa-postgres-interface"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "arrow",
  "async-trait",

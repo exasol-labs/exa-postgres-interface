@@ -87,6 +87,17 @@ static REGCLASS_LITERAL_RE: LazyLock<Regex> = LazyLock::new(|| {
 // name a client inlines as `'<name>'::regclass`, e.g. `'"TEST"."SALES_HOT"'`.
 static REGCLASS_STRING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)'([^']*)'\s*::\s*regclass"#).unwrap());
+// Beekeeper's foreign-key relation queries filter by the owning table
+// (`n`/`t` aliases, outgoing keys) or the referenced table (`nf`/`tf`,
+// incoming keys). The schema/table arrive already inlined as literals.
+static FK_OUT_SCHEMA_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bn\.nspname\s*=\s*'([^']*)'").unwrap());
+static FK_OUT_TABLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bt\.relname\s*=\s*'([^']*)'").unwrap());
+static FK_IN_SCHEMA_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bnf\.nspname\s*=\s*'([^']*)'").unwrap());
+static FK_IN_TABLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\btf\.relname\s*=\s*'([^']*)'").unwrap());
 static QUOTE_IDENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bquote_ident\s*\(\s*([^()]+?)\s*\)").unwrap());
 // Beekeeper's listTableColumns asks for column comments via
@@ -798,6 +809,30 @@ WHERE 1 = 0
         }
     }
 
+    // Beekeeper's getOutgoingKeys / getIncomingKeys enumerate foreign keys via
+    // PG_CONSTRAINT + GENERATE_SUBSCRIPTS + array indexing (`conkey[pos]`),
+    // none of which Exasol supports. Exasol keeps foreign keys in
+    // SYS.EXA_ALL_CONSTRAINT_COLUMNS (with REFERENCED_* columns), so rewrite to
+    // a native lookup. Outgoing keys filter on the owning table; incoming keys
+    // on the referenced table (and label the local column `from_column`).
+    if normalized.contains("pg_constraint")
+        && normalized.contains("generate_subscripts")
+        && normalized.contains("contype = 'f'")
+    {
+        if let (Some(schema), Some(table)) = (
+            FK_OUT_SCHEMA_RE.captures(sql).map(|c| c[1].to_owned()),
+            FK_OUT_TABLE_RE.captures(sql).map(|c| c[1].to_owned()),
+        ) {
+            return foreign_key_query(&schema, &table, false);
+        }
+        if let (Some(schema), Some(table)) = (
+            FK_IN_SCHEMA_RE.captures(sql).map(|c| c[1].to_owned()),
+            FK_IN_TABLE_RE.captures(sql).map(|c| c[1].to_owned()),
+        ) {
+            return foreign_key_query(&schema, &table, true);
+        }
+    }
+
     sql.to_owned()
 }
 
@@ -832,6 +867,38 @@ fn primary_key_query(schema: Option<&str>, table: &str) -> String {
          ON c.COLUMN_SCHEMA = cc.CONSTRAINT_SCHEMA AND c.COLUMN_TABLE = cc.CONSTRAINT_TABLE \
          AND c.COLUMN_NAME = cc.COLUMN_NAME \
          WHERE {filter} ORDER BY cc.ORDINAL_POSITION"
+    )
+}
+
+/// Native Exasol foreign-key lookup matching Beekeeper's getOutgoingKeys
+/// (`incoming = false`) / getIncomingKeys (`incoming = true`) result shape.
+/// Exasol doesn't record per-constraint update/delete actions, so both rules
+/// default to `NO ACTION`. Aliases are quoted lowercase so labels reach the
+/// client as PostgreSQL would fold them.
+fn foreign_key_query(schema: &str, table: &str, incoming: bool) -> String {
+    let esc = |s: &str| s.replace('\'', "''");
+    // Outgoing keys are owned by the table; incoming keys reference it.
+    let (schema_col, table_col) = if incoming {
+        ("cc.REFERENCED_SCHEMA", "cc.REFERENCED_TABLE")
+    } else {
+        ("cc.CONSTRAINT_SCHEMA", "cc.CONSTRAINT_TABLE")
+    };
+    // getIncomingKeys labels the local column `from_column`; getOutgoingKeys
+    // labels it `column_name`.
+    let local_column_alias = if incoming { "from_column" } else { "column_name" };
+    format!(
+        "SELECT cc.CONSTRAINT_NAME AS \"constraint_name\", \
+         cc.COLUMN_NAME AS \"{local_column_alias}\", \
+         cc.CONSTRAINT_SCHEMA AS \"from_schema\", cc.CONSTRAINT_TABLE AS \"from_table\", \
+         cc.REFERENCED_COLUMN AS \"to_column\", cc.REFERENCED_TABLE AS \"to_table\", \
+         cc.REFERENCED_SCHEMA AS \"to_schema\", \
+         'NO ACTION' AS \"update_rule\", 'NO ACTION' AS \"delete_rule\", \
+         cc.ORDINAL_POSITION AS \"ordinal_position\" \
+         FROM SYS.EXA_ALL_CONSTRAINT_COLUMNS cc \
+         WHERE cc.CONSTRAINT_TYPE = 'FOREIGN KEY' AND {schema_col} = '{}' AND {table_col} = '{}' \
+         ORDER BY cc.CONSTRAINT_NAME, cc.ORDINAL_POSITION",
+        esc(schema),
+        esc(table)
     )
 }
 
@@ -1561,6 +1628,34 @@ WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
                 .unwrap()
                 .contains("OFFSET 50")
         );
+    }
+
+    #[test]
+    fn rewrites_beekeeper_foreign_key_queries() {
+        let outgoing = "SELECT c.conname AS constraint_name, a.attname AS column_name, n.nspname AS from_schema, \
+            t.relname AS from_table, af.attname AS to_column, tf.relname AS to_table, nf.nspname AS to_schema, \
+            pos AS ordinal_position FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid \
+            JOIN pg_namespace n ON t.relnamespace = n.oid JOIN generate_subscripts(c.conkey, 1) pos ON true \
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = c.conkey[pos] \
+            JOIN pg_class tf ON c.confrelid = tf.oid JOIN pg_namespace nf ON tf.relnamespace = nf.oid \
+            JOIN pg_attribute af ON af.attrelid = tf.oid AND af.attnum = c.confkey[pos] \
+            WHERE c.contype = 'f' AND n.nspname = 'TEST' AND t.relname = 'SALES_HOT' ORDER BY c.conname, pos";
+        let out = translate_postgres_to_exasol(outgoing).unwrap();
+        let upper = out.to_ascii_uppercase();
+        assert!(!upper.contains("GENERATE_SUBSCRIPTS") && !upper.contains("PG_CONSTRAINT"), "got: {out}");
+        assert!(upper.contains("EXA_ALL_CONSTRAINT_COLUMNS"));
+        assert!(out.contains("CONSTRAINT_TYPE = 'FOREIGN KEY'"));
+        assert!(out.contains("cc.CONSTRAINT_SCHEMA = 'TEST'") && out.contains("cc.CONSTRAINT_TABLE = 'SALES_HOT'"), "got: {out}");
+        assert!(out.contains("AS \"column_name\"") && out.contains("AS \"to_table\""));
+
+        // Incoming keys filter on the referenced side and label the local column from_column.
+        let incoming = outgoing
+            .replace("n.nspname = 'TEST'", "nf.nspname = 'TEST'")
+            .replace("t.relname = 'SALES_HOT'", "tf.relname = 'SALES_HOT'")
+            .replace("a.attname AS column_name", "a.attname AS from_column");
+        let out_in = translate_postgres_to_exasol(&incoming).unwrap();
+        assert!(out_in.contains("cc.REFERENCED_SCHEMA = 'TEST'") && out_in.contains("cc.REFERENCED_TABLE = 'SALES_HOT'"), "got: {out_in}");
+        assert!(out_in.contains("AS \"from_column\""), "got: {out_in}");
     }
 
     #[test]
