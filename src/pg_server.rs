@@ -1338,7 +1338,7 @@ fn map_exasol_columns(schema: &Schema) -> Vec<FieldInfo> {
         .map(|field| {
             let pg_type = pg_type_for_arrow_field(field);
             FieldInfo::new(
-                field.name().to_owned(),
+                fold_exasol_column_name(field.name()),
                 None,
                 None,
                 pg_type,
@@ -1346,6 +1346,22 @@ fn map_exasol_columns(schema: &Schema) -> Vec<FieldInfo> {
             )
         })
         .collect()
+}
+
+/// PostgreSQL folds unquoted identifiers to lowercase; Exasol folds them to
+/// uppercase. So `SELECT col AS name` comes back from Exasol labelled `NAME`,
+/// and PostgreSQL wire clients that read result fields case-sensitively (e.g.
+/// Beekeeper's node-postgres driver looking up `row.name`) never find it. Fold
+/// an all-uppercase Exasol column label back to lowercase to match
+/// PostgreSQL's default. Leave any label that already contains a lowercase
+/// letter untouched: those can only come from an explicitly quoted alias such
+/// as `AS "userId"`, whose case the client deliberately chose.
+fn fold_exasol_column_name(name: &str) -> String {
+    if name.chars().any(|c| c.is_ascii_lowercase()) {
+        name.to_owned()
+    } else {
+        name.to_ascii_lowercase()
+    }
 }
 
 fn cursor_schema_for(batches: &[RecordBatch]) -> SchemaRef {
@@ -1726,7 +1742,7 @@ impl GatewayResponse {
                 .iter()
                 .map(|column| {
                     FieldInfo::new(
-                        column.name.clone(),
+                        fold_exasol_column_name(&column.name),
                         None,
                         None,
                         pg_type_for_exasol_data_type(&column.data_type),
@@ -2007,7 +2023,7 @@ fn query_response_typed(
         .into_iter()
         .map(|column| {
             FieldInfo::new(
-                column.name,
+                fold_exasol_column_name(&column.name),
                 None,
                 None,
                 pg_type_for_exasol_data_type(&column.data_type),
@@ -2537,6 +2553,25 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn folds_uppercase_exasol_column_names_but_preserves_mixed_case() {
+        // Exasol uppercases unquoted aliases (`AS name` -> `NAME`); fold those
+        // back to lowercase so PostgreSQL clients find them. An explicitly
+        // quoted mixed-case alias (`AS "userId"`) must survive untouched.
+        assert_eq!(fold_exasol_column_name("NAME"), "name");
+        assert_eq!(fold_exasol_column_name("ROUTINE_SCHEMA"), "routine_schema");
+        assert_eq!(fold_exasol_column_name("userId"), "userId");
+        assert_eq!(fold_exasol_column_name("schema"), "schema");
+
+        let schema = Schema::new(vec![
+            Field::new("NAME", DataType::Utf8, true),
+            Field::new("userId", DataType::Utf8, true),
+        ]);
+        let fields = map_exasol_columns(&schema);
+        assert_eq!(fields[0].name(), "name");
+        assert_eq!(fields[1].name(), "userId");
     }
 
     #[test]
