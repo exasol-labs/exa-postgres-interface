@@ -42,7 +42,7 @@ use crate::policy::{
     CursorClose, CursorDeclare, CursorDirection, CursorPlan, CursorPosition, RowCountPolicy,
     StatementPlan, classify_statement,
 };
-use crate::translator::translate_postgres_to_exasol;
+use crate::translator::{is_passthrough_query, translate_postgres_to_exasol};
 
 struct SessionState {
     exasol: Mutex<ExasolSession>,
@@ -62,11 +62,16 @@ enum GatewayResponse {
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
         command_tag: Option<String>,
+        // Fold all-uppercase column labels to lowercase (PostgreSQL semantics).
+        // True for translated catalog queries, false for passthrough data
+        // queries whose real Exasol column names the client must see verbatim.
+        fold_labels: bool,
     },
     TypedQuery {
         columns: Vec<ExasolColumn>,
         rows: Vec<Vec<Option<String>>>,
         command_tag: Option<String>,
+        fold_labels: bool,
     },
     Execution {
         command: String,
@@ -298,6 +303,7 @@ impl ExasolPgWireHandler {
                     .session_extensions()
                     .get::<SessionState>()
                     .ok_or_else(|| pg_error("08003", "Exasol session is not connected"))?;
+                let fold_labels = self.should_fold_labels(sql);
                 let sql = self.translate_client_sql(sql)?;
                 let outcome = {
                     let mut session = state.exasol.lock().await;
@@ -306,7 +312,7 @@ impl ExasolPgWireHandler {
                         .await
                         .map_err(map_exasol_execution_error)?
                 };
-                map_exasol_result(outcome, command, row_count)
+                map_exasol_result(outcome, command, row_count, fold_labels)
             }
         }
     }
@@ -427,6 +433,8 @@ impl ExasolPgWireHandler {
                     schema,
                     batches,
                     command_tag: Some("FETCH".to_owned()),
+                    // Cursors wrap user data queries; keep real column names.
+                    fold_labels: false,
                 }
             }
             (CursorMetadata::Typed { columns }, CursorStepRows::Typed { rows }) => {
@@ -434,6 +442,7 @@ impl ExasolPgWireHandler {
                     columns,
                     rows,
                     command_tag: Some("FETCH".to_owned()),
+                    fold_labels: false,
                 }
             }
             _ => {
@@ -822,7 +831,9 @@ impl ExasolPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let outcome = self.execute_exasol_sql(client, sql).await?;
-        let mut responses = map_exasol_result(outcome, "SELECT", RowCountPolicy::Omit)?;
+        // Gateway-authored metadata SQL already spells its column names the way
+        // the client expects, so don't fold them.
+        let mut responses = map_exasol_result(outcome, "SELECT", RowCountPolicy::Omit, false)?;
         Ok(responses.pop().unwrap_or(GatewayResponse::Empty))
     }
 
@@ -874,6 +885,15 @@ impl ExasolPgWireHandler {
     {
         let sql = self.translate_client_sql(sql)?;
         self.execute_exasol_sql(client, &sql).await
+    }
+
+    /// Result column labels are folded to lowercase only for translated
+    /// catalog queries (where the client reads case-sensitive lowercase
+    /// aliases). Passthrough data queries keep Exasol's real column names so
+    /// they match the column metadata the client built its grid from. When
+    /// translation is disabled the gateway is a pure proxy and never folds.
+    fn should_fold_labels(&self, sql: &str) -> bool {
+        self.config.translation.enabled && !is_passthrough_query(sql)
     }
 
     fn translate_client_sql(&self, sql: &str) -> PgWireResult<String> {
@@ -1306,6 +1326,7 @@ fn map_exasol_result(
     outcome: ExasolOutcome,
     command: &str,
     row_count_policy: RowCountPolicy,
+    fold_labels: bool,
 ) -> PgWireResult<Vec<GatewayResponse>> {
     match outcome {
         ExasolOutcome::ArrowRows(batches) => {
@@ -1314,12 +1335,14 @@ fn map_exasol_result(
                 schema,
                 batches,
                 command_tag: None,
+                fold_labels,
             }])
         }
         ExasolOutcome::TypedRows { columns, rows } => Ok(vec![GatewayResponse::TypedQuery {
             columns,
             rows,
             command_tag: None,
+            fold_labels,
         }]),
         ExasolOutcome::RowCount(rows) => Ok(vec![GatewayResponse::Execution {
             command: command.to_owned(),
@@ -1331,14 +1354,14 @@ fn map_exasol_result(
     }
 }
 
-fn map_exasol_columns(schema: &Schema) -> Vec<FieldInfo> {
+fn map_exasol_columns(schema: &Schema, fold_labels: bool) -> Vec<FieldInfo> {
     schema
         .fields()
         .iter()
         .map(|field| {
             let pg_type = pg_type_for_arrow_field(field);
             FieldInfo::new(
-                fold_exasol_column_name(field.name()),
+                maybe_fold_label(field.name(), fold_labels),
                 None,
                 None,
                 pg_type,
@@ -1346,6 +1369,14 @@ fn map_exasol_columns(schema: &Schema) -> Vec<FieldInfo> {
             )
         })
         .collect()
+}
+
+fn maybe_fold_label(name: &str, fold_labels: bool) -> String {
+    if fold_labels {
+        fold_exasol_column_name(name)
+    } else {
+        name.to_owned()
+    }
 }
 
 /// PostgreSQL folds unquoted identifiers to lowercase; Exasol folds them to
@@ -1737,12 +1768,18 @@ impl GatewayResponse {
                 .cloned()
                 .map(|name| FieldInfo::new(name, None, None, Type::TEXT, FieldFormat::Text))
                 .collect(),
-            GatewayResponse::ArrowQuery { schema, .. } => map_exasol_columns(schema),
-            GatewayResponse::TypedQuery { columns, .. } => columns
+            GatewayResponse::ArrowQuery {
+                schema, fold_labels, ..
+            } => map_exasol_columns(schema, *fold_labels),
+            GatewayResponse::TypedQuery {
+                columns,
+                fold_labels,
+                ..
+            } => columns
                 .iter()
                 .map(|column| {
                     FieldInfo::new(
-                        fold_exasol_column_name(&column.name),
+                        maybe_fold_label(&column.name, *fold_labels),
                         None,
                         None,
                         pg_type_for_exasol_data_type(&column.data_type),
@@ -1768,16 +1805,24 @@ impl TryFrom<GatewayResponse> for Response {
                 schema,
                 batches,
                 command_tag,
+                fold_labels,
             } => Response::Query(query_response_arrow(
                 schema,
                 batches,
                 command_tag.as_deref(),
+                fold_labels,
             )?),
             GatewayResponse::TypedQuery {
                 columns,
                 rows,
                 command_tag,
-            } => Response::Query(query_response_typed(columns, rows, command_tag.as_deref())?),
+                fold_labels,
+            } => Response::Query(query_response_typed(
+                columns,
+                rows,
+                command_tag.as_deref(),
+                fold_labels,
+            )?),
             GatewayResponse::Execution { command, rows } => {
                 let tag = if let Some(rows) = rows {
                     if command == "INSERT" {
@@ -2018,12 +2063,13 @@ fn query_response_typed(
     columns: Vec<ExasolColumn>,
     rows: Vec<Vec<Option<String>>>,
     command_tag: Option<&str>,
+    fold_labels: bool,
 ) -> PgWireResult<QueryResponse> {
     let fields = columns
         .into_iter()
         .map(|column| {
             FieldInfo::new(
-                fold_exasol_column_name(&column.name),
+                maybe_fold_label(&column.name, fold_labels),
                 None,
                 None,
                 pg_type_for_exasol_data_type(&column.data_type),
@@ -2107,8 +2153,9 @@ fn query_response_arrow(
     arrow_schema: SchemaRef,
     batches: Vec<RecordBatch>,
     command_tag: Option<&str>,
+    fold_labels: bool,
 ) -> PgWireResult<QueryResponse> {
-    let fields = map_exasol_columns(arrow_schema.as_ref());
+    let fields = map_exasol_columns(arrow_schema.as_ref(), fold_labels);
     let pg_schema = Arc::new(fields);
     let pg_schema_for_rows = pg_schema.clone();
     let mut encoder = DataRowEncoder::new(pg_schema_for_rows.clone());
@@ -2502,6 +2549,7 @@ mod tests {
             ExasolOutcome::RowCount(3),
             "UPDATE",
             RowCountPolicy::Include,
+            false,
         )
         .unwrap()
         .pop()
@@ -2519,6 +2567,7 @@ mod tests {
             ExasolOutcome::RowCount(0),
             "CREATE TABLE",
             RowCountPolicy::Omit,
+            false,
         )
         .unwrap()
         .pop()
@@ -2534,7 +2583,7 @@ mod tests {
     fn maps_arrow_outcome_to_typed_response_using_field_metadata() {
         let batch = int_batch("id", &[Some(1), Some(2)]);
         let outcome = ExasolOutcome::ArrowRows(vec![batch]);
-        let response = map_exasol_result(outcome, "SELECT", RowCountPolicy::Omit)
+        let response = map_exasol_result(outcome, "SELECT", RowCountPolicy::Omit, true)
             .unwrap()
             .pop()
             .unwrap();
@@ -2544,6 +2593,7 @@ mod tests {
                 schema,
                 batches,
                 command_tag,
+                ..
             } => {
                 assert_eq!(schema.fields().len(), 1);
                 assert_eq!(schema.field(0).name(), "id");
@@ -2569,9 +2619,12 @@ mod tests {
             Field::new("NAME", DataType::Utf8, true),
             Field::new("userId", DataType::Utf8, true),
         ]);
-        let fields = map_exasol_columns(&schema);
+        let fields = map_exasol_columns(&schema, true);
         assert_eq!(fields[0].name(), "name");
         assert_eq!(fields[1].name(), "userId");
+        // With folding disabled the original (upper-case) names are preserved.
+        let unfolded = map_exasol_columns(&schema, false);
+        assert_eq!(unfolded[0].name(), "NAME");
     }
 
     #[test]
@@ -2684,7 +2737,7 @@ mod tests {
     fn can_set_fetch_query_response_command_tag() {
         let batch = int_batch("id", &[Some(1)]);
         let schema = batch.schema();
-        let response = query_response_arrow(schema, vec![batch], Some("FETCH")).unwrap();
+        let response = query_response_arrow(schema, vec![batch], Some("FETCH"), false).unwrap();
 
         assert_eq!(response.command_tag(), "FETCH");
     }
@@ -2837,7 +2890,7 @@ mod tests {
             rows: rows.clone(),
         };
 
-        let response = map_exasol_result(outcome, "SELECT", RowCountPolicy::Omit)
+        let response = map_exasol_result(outcome, "SELECT", RowCountPolicy::Omit, false)
             .unwrap()
             .pop()
             .unwrap();
@@ -2847,6 +2900,7 @@ mod tests {
                 columns: out_columns,
                 rows: out_rows,
                 command_tag,
+                ..
             } => {
                 assert_eq!(out_columns.len(), 1);
                 assert_eq!(out_columns[0].name, "id");
@@ -2867,6 +2921,7 @@ mod tests {
             columns,
             rows: vec![vec![Some("alice".to_owned())]],
             command_tag: Some("SELECT".to_owned()),
+            fold_labels: false,
         };
 
         match Response::try_from(response).unwrap() {
@@ -2893,6 +2948,7 @@ mod tests {
             columns,
             rows: Vec::new(),
             command_tag: None,
+            fold_labels: false,
         };
         let fields = response.fields();
         assert_eq!(fields.len(), 2);

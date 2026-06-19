@@ -291,6 +291,16 @@ const INFORMATION_SCHEMA_COLUMNS: &[&str] = &[
     "IS_UPDATABLE",
 ];
 
+/// Whether `sql` is forwarded to Exasol essentially unchanged (no dialect
+/// rewriting). Used by the result layer to decide whether to fold result
+/// column labels to lowercase: a passthrough query selects real Exasol columns
+/// whose (upper-case) names the client must see verbatim, whereas a translated
+/// catalog query carries lower-case aliases the client reads case-sensitively.
+pub fn is_passthrough_query(sql: &str) -> bool {
+    let sql = strip_exasol_catalog_prefix(sql);
+    is_exasol_passthrough_sql(sql.as_str())
+}
+
 pub fn translate_postgres_to_exasol(sql: &str) -> Result<String, TranslationError> {
     let sql = strip_exasol_catalog_prefix(sql);
     let sql = sql.as_str();
