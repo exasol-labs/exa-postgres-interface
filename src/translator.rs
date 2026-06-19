@@ -85,6 +85,19 @@ static REGCLASS_LITERAL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static QUOTE_IDENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bquote_ident\s*\(\s*([^()]+?)\s*\)").unwrap());
+// Beekeeper's listTableColumns asks for column comments via
+// `col_description(format('%I.%I', table_schema, table_name)::regclass::oid,
+// ordinal_position)`. Exasol has no `format()` and no `regclass` type, so the
+// whole statement fails to parse and the client shows no columns at all.
+// Exasol column comments aren't reachable through this oid-based lookup anyway,
+// so collapse the entire call to NULL — the columns list works, only the
+// (rarely used) per-column comment is dropped.
+static COL_DESCRIPTION_FORMAT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:pg_catalog\.)?col_description\s*\(\s*format\s*\([^)]*\)\s*::\s*regclass\s*(?:::\s*oid\s*)?,[^)]*\)",
+    )
+    .unwrap()
+});
 // Strips a leading "exasol" catalog qualifier from 3-part references so that
 // `["exasol".]schema.table` becomes `schema.table`. Each segment may be
 // independently quoted.
@@ -768,6 +781,12 @@ WHERE 1 = 0
 
 fn rewrite_pg_catalog(sql: &str) -> String {
     let mut sql = normalize_ansi_quoted_postgres_identifiers(sql);
+    // Drop the unsupported col_description(format(...)::regclass::oid, ...)
+    // comment lookup before anything else tries to map col_description to a
+    // catalog UDF or transpile the format()/regclass parts.
+    sql = COL_DESCRIPTION_FORMAT_RE
+        .replace_all(&sql, "CAST(NULL AS VARCHAR(2000000))")
+        .to_string();
     sql = rewrite_quote_ident(&sql);
     sql = rewrite_qualified_operators(&sql);
     sql = rewrite_object_description(&sql);
@@ -991,47 +1010,91 @@ fn rewrite_quote_ident(sql: &str) -> String {
         .to_string()
 }
 
-// Exasol reserved words that PostgreSQL clients commonly emit as bare column
-// aliases. Grafana's `AS time`, JDBC drivers' `AS schema`, hand-written
-// `AS value`, etc. all parse fine in PostgreSQL but blow up in Exasol because
-// the unquoted identifier collides with a reserved keyword. We don't try to
-// quote every Exasol reserved word — just the ones that show up as aliases in
-// real client traffic. Lowercase entries; comparison is case-insensitive.
+// Exasol reserved keywords. PostgreSQL clients routinely emit these as bare
+// column aliases (`AS time`, `AS schema`, `AS position`, `AS condition`, ...);
+// they parse fine in PostgreSQL but Exasol rejects an unquoted identifier that
+// collides with a reserved keyword. This is the authoritative reserved set
+// from Exasol's `EXA_SQL_KEYWORDS` system table (`WHERE reserved = TRUE`) --
+// regenerate from there when upgrading Exasol. Lowercase entries; comparison
+// is case-insensitive. Non-reserved identifiers that Exasol merely upper-cases
+// (e.g. `name`, `id`) don't error; their labels are folded back to lowercase
+// at the result layer instead.
 static RESERVED_ALIAS_WORDS: LazyLock<std::collections::HashSet<&'static str>> =
     LazyLock::new(|| {
         [
-            "action",
-            "column",
-            "current",
-            "date",
-            "default",
-            "group",
-            "key",
-            "level",
-            "order",
-            "partition",
-            "range",
-            "schema",
-            "session",
-            "size",
-            "statement",
-            "table",
-            "time",
-            "user",
-            "value",
-            "zone",
+            "absolute", "action", "add", "after", "all", "allocate", "alter", "and",
+            "any", "append", "are", "array", "as", "asc", "asensitive", "assertion",
+            "at", "attribute", "authid", "authorization", "before", "begin", "between", "bigint",
+            "binary", "bit", "blob", "blocked", "bool", "boolean", "both", "by",
+            "byte", "call", "called", "cardinality", "cascade", "cascaded", "case", "casespecific",
+            "cast", "catalog", "chain", "char", "character", "character_set_catalog", "character_set_name", "character_set_schema",
+            "characteristics", "check", "checked", "clob", "close", "coalesce", "collate", "collation",
+            "collation_catalog", "collation_name", "collation_schema", "column", "commit", "condition", "connect_by_iscycle", "connect_by_isleaf",
+            "connect_by_root", "connection", "constant", "constraint", "constraint_state_default", "constraints", "constructor", "contains",
+            "continue", "control", "convert", "corresponding", "create", "cs", "csv", "cube",
+            "current", "current_cluster", "current_cluster_uid", "current_date", "current_path", "current_role", "current_schema", "current_session",
+            "current_statement", "current_time", "current_timestamp", "current_user", "cursor", "cycle", "data", "datalink",
+            "date", "datetime_interval_code", "datetime_interval_precision", "day", "dbtimezone", "deallocate", "dec", "decimal",
+            "declare", "default", "default_like_escape_character", "deferrable", "deferred", "defined", "definer", "delete",
+            "deref", "derived", "desc", "describe", "descriptor", "deterministic", "disable", "disabled",
+            "disconnect", "dispatch", "distinct", "dlurlcomplete", "dlurlpath", "dlurlpathonly", "dlurlscheme", "dlurlserver",
+            "dlvalue", "do", "domain", "double", "drop", "dynamic", "dynamic_function", "dynamic_function_code",
+            "each", "else", "elseif", "elsif", "emits", "enable", "enabled", "end",
+            "end-exec", "endif", "enforce", "equals", "errors", "escape", "except", "exception",
+            "exec", "execute", "exists", "exit", "export", "external", "extract", "false",
+            "fbv", "fetch", "file", "final", "first", "float", "following", "for",
+            "forall", "force", "format", "found", "free", "from", "fs", "full",
+            "function", "general", "generated", "geometry", "get", "global", "go", "goto",
+            "grant", "granted", "group", "group_concat", "grouping", "groups", "hashtype", "hashtype_format",
+            "having", "high", "hold", "hour", "identity", "if", "ifnull", "immediate",
+            "impersonate", "implementation", "import", "in", "index", "indicator", "inner", "inout",
+            "input", "insensitive", "insert", "instance", "instantiable", "int", "integer", "integrity",
+            "intersect", "interval", "into", "inverse", "invoker", "is", "iterate", "join",
+            "key_member", "key_type", "large", "last", "lateral", "ldap", "leading", "leave",
+            "left", "level", "like", "limit", "listagg", "local", "localtime", "localtimestamp",
+            "locator", "log", "longvarchar", "loop", "low", "map", "match", "matched",
+            "merge", "method", "minus", "minute", "mod", "modifies", "modify", "module",
+            "month", "names", "national", "natural", "nchar", "nclob", "new", "next",
+            "nls_date_format", "nls_date_language", "nls_first_day_of_week", "nls_numeric_characters", "nls_timestamp_format", "no", "nocycle", "nologging",
+            "none", "not", "null", "nullif", "number", "numeric", "nvarchar", "nvarchar2",
+            "object", "of", "off", "old", "on", "only", "open", "option",
+            "options", "or", "order", "ordering", "ordinality", "others", "out", "outer",
+            "output", "over", "overlaps", "overlay", "overriding", "pad", "parallel_enable", "parameter",
+            "parameter_specific_catalog", "parameter_specific_name", "parameter_specific_schema", "parquet", "partial", "path", "permission", "placing",
+            "plus", "position", "preceding", "preferring", "prepare", "preserve", "prior", "privileges",
+            "procedure", "profile", "qualify", "random", "range", "read", "reads", "real",
+            "recovery", "recursive", "ref", "references", "referencing", "refresh", "regexp_like", "relative",
+            "release", "rename", "repeat", "replace", "restore", "restrict", "result", "return",
+            "returned_length", "returned_octet_length", "returns", "revoke", "right", "rollback", "rollup", "routine",
+            "row", "rows", "rowtype", "savepoint", "schema", "scope", "scope_user", "script",
+            "scroll", "search", "second", "section", "security", "select", "selective", "self",
+            "sensitive", "separator", "sequence", "session", "session_user", "sessiontimezone", "set", "sets",
+            "shortint", "similar", "smallint", "some", "source", "space", "specific", "specifictype",
+            "sql", "sql_bigint", "sql_bit", "sql_char", "sql_date", "sql_decimal", "sql_double", "sql_float",
+            "sql_integer", "sql_longvarchar", "sql_numeric", "sql_preprocessor_script", "sql_real", "sql_smallint", "sql_timestamp", "sql_tinyint",
+            "sql_type_date", "sql_type_timestamp", "sql_varchar", "sqlexception", "sqlstate", "sqlwarning", "start", "state",
+            "statement", "static", "structure", "style", "substring", "subtype", "sysdate", "system",
+            "system_user", "systimestamp", "table", "temporary", "text", "then", "time", "timestamp",
+            "timezone_hour", "timezone_minute", "tinyint", "to", "trailing", "transaction", "transform", "transforms",
+            "translation", "treat", "trigger", "trim", "true", "truncate", "under", "union",
+            "unique", "unknown", "unlink", "unnest", "until", "update", "usage", "user",
+            "using", "value", "values", "varchar", "varchar2", "varray", "verify", "view",
+            "when", "whenever", "where", "while", "window", "with", "within", "without",
+            "work", "year", "yes", "zone",
         ]
         .into_iter()
         .collect()
     });
 
-// Matches `AS <ident>` plus any trailing whitespace and an optional `)`. The
-// trailing group is how we tell aliases (`SELECT x AS time FROM ...`) from
-// cast type arguments (`CAST(x AS DATE)`): if the capture ends in `)`, we're
-// inside a CAST and must leave the identifier alone. (Rust's `regex` crate
-// has no lookahead, so we capture instead of peeking.)
+// Matches `AS <ident>` plus any trailing whitespace and an optional bracket.
+// The trailing group is how we tell a real alias (`SELECT x AS time FROM ...`)
+// from a cast type name, which is never a candidate for quoting: a trailing
+// `)` means `CAST(x AS DATE)` and a trailing `(` means a parameterised type
+// like `CAST(x AS VARCHAR(255))`. An alias is never immediately followed by a
+// bracket, so either one rules out quoting. (Rust's `regex` crate has no
+// lookahead, so we capture instead of peeking.)
 static ALIAS_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bAS\s+([A-Za-z_][A-Za-z0-9_]*)(\s*\)?)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\bAS\s+([A-Za-z_][A-Za-z0-9_]*)(\s*[()]?)").unwrap());
 
 /// Quote any `AS <ident>` whose identifier is an Exasol reserved word.
 ///
@@ -1044,8 +1107,9 @@ fn quote_reserved_aliases(sql: &str) -> String {
             let whole = cap.get(0).map(|m| m.as_str()).unwrap_or("");
             let ident = cap.get(1).map(|m| m.as_str()).unwrap_or("");
             let trailing = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-            if trailing.contains(')') {
-                // CAST(... AS TYPE) — leave the type argument alone.
+            if trailing.contains(')') || trailing.contains('(') {
+                // CAST(... AS TYPE) or CAST(... AS TYPE(n)) — a type name, not
+                // an alias; leave it alone.
                 return whole.to_owned();
             }
             if RESERVED_ALIAS_WORDS.contains(ident.to_ascii_lowercase().as_str()) {
@@ -1410,6 +1474,38 @@ WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
         // Should not contain double-quoting.
         assert!(!translated.contains("AS \"\"time\""));
         assert!(translated.contains("AS \"time\""));
+    }
+
+    #[test]
+    fn quotes_position_and_condition_reserved_aliases() {
+        // Beekeeper's getPrimaryKeys uses `AS position`; listTableTriggers uses
+        // `AS condition`. Both are reserved in Exasol and must be quoted.
+        assert!(
+            translate_postgres_to_exasol("SELECT a.attnum AS position FROM t")
+                .unwrap()
+                .contains("AS \"position\"")
+        );
+        assert!(
+            translate_postgres_to_exasol("SELECT action_condition AS condition FROM t")
+                .unwrap()
+                .contains("AS \"condition\"")
+        );
+    }
+
+    #[test]
+    fn neutralizes_beekeeper_col_description_format_lookup() {
+        // Beekeeper's listTableColumns column-comment expression uses format()
+        // and ::regclass, neither of which Exasol supports; collapsing it to
+        // NULL keeps the column list working.
+        let sql = "SELECT column_name, \
+                   pg_catalog.col_description(format('%I.%I', table_schema, table_name)::regclass::oid, ordinal_position) AS column_comment \
+                   FROM information_schema.columns WHERE table_schema = 'S' AND table_name = 'T'";
+        let translated = translate_postgres_to_exasol(sql).unwrap();
+        let upper = translated.to_ascii_uppercase();
+        assert!(!upper.contains("FORMAT("), "got: {translated}");
+        assert!(!upper.contains("COL_DESCRIPTION"), "got: {translated}");
+        assert!(!upper.contains("REGCLASS"), "got: {translated}");
+        assert!(translated.contains("AS column_comment") || translated.contains("AS \"column_comment\""));
     }
 
     #[test]
