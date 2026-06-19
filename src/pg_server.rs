@@ -273,6 +273,18 @@ impl ExasolPgWireHandler {
             StatementPlan::ClientSelect { columns, rows } => {
                 Ok(vec![GatewayResponse::Query { columns, rows }])
             }
+            StatementPlan::BackendPid { column } => {
+                // Report the connection's own BackendKeyData pid — the same
+                // value advertised at startup and used by the cancel protocol.
+                // It's unique per connection and int4-sized, and (unlike
+                // Exasol's session process number, which lives in a DBA-only
+                // base table) is available to every gateway user.
+                let (pid, _) = client.pid_and_secret_key();
+                Ok(vec![GatewayResponse::Query {
+                    columns: vec![column],
+                    rows: vec![vec![Some(pid.to_string())]],
+                }])
+            }
             StatementPlan::Cursor(plan) => self.execute_cursor_plan(client, plan).await,
             StatementPlan::Reject { sqlstate, message } => {
                 warn!(%sqlstate, %message, "rejecting unsupported statement");

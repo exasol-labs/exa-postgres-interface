@@ -24,6 +24,12 @@ pub enum StatementPlan {
         columns: Vec<String>,
         rows: Vec<Vec<Option<String>>>,
     },
+    /// `SELECT pg_backend_pid()` — answered with the connection's own
+    /// BackendKeyData pid, resolved in the execution path where the client
+    /// (and thus its pid) is in scope. `column` carries the client's alias.
+    BackendPid {
+        column: String,
+    },
     Cursor(CursorPlan),
     Empty,
     Reject {
@@ -645,17 +651,18 @@ fn local_select(sql: &str) -> Option<StatementPlan> {
     }
     // Beekeeper (and other clients) call pg_backend_pid() to label the
     // connection. Exasol has no such function, so it errors if the call
-    // reaches the engine. Answer locally with a synthetic, stable value and
-    // honor the client's alias when present (e.g. `... AS pid`).
+    // reaches the engine. Answer it with the connection's own BackendKeyData
+    // pid (resolved later, where the client is in scope) and honor the
+    // client's alias when present (e.g. `... AS pid`).
     if lower == "select pg_backend_pid()" || lower.starts_with("select pg_backend_pid() as ") {
         // No FROM clause here, so select_alias() can't help; take the alias
         // straight from the matched `... AS <name>` suffix.
-        let name = lower
+        let column = lower
             .find(" as ")
             .map(|idx| unquote_identifier(&sql[idx + 4..]))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "pg_backend_pid".to_owned());
-        return Some(single_value(&name, "1"));
+        return Some(StatementPlan::BackendPid { column });
     }
     None
 }
@@ -1011,19 +1018,21 @@ mod tests {
 
     #[test]
     fn answers_pg_backend_pid_locally() {
-        // Exasol has no pg_backend_pid(); the gateway must answer it without a
-        // round-trip and preserve the client's alias.
-        assert!(matches!(
+        // Exasol has no pg_backend_pid(); the gateway answers it from the
+        // connection's own pid (resolved in the execution path) and preserves
+        // the client's alias.
+        assert_eq!(
             classify_statement("SELECT pg_backend_pid()"),
-            StatementPlan::ClientSelect { .. }
-        ));
-        match classify_statement("SELECT pg_backend_pid() AS pid") {
-            StatementPlan::ClientSelect { columns, rows } => {
-                assert_eq!(columns, vec!["pid".to_owned()]);
-                assert_eq!(rows, vec![vec![Some("1".to_owned())]]);
+            StatementPlan::BackendPid {
+                column: "pg_backend_pid".to_owned()
             }
-            other => panic!("expected ClientSelect, got {other:?}"),
-        }
+        );
+        assert_eq!(
+            classify_statement("SELECT pg_backend_pid() AS pid"),
+            StatementPlan::BackendPid {
+                column: "pid".to_owned()
+            }
+        );
     }
 
     #[test]
