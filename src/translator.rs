@@ -98,6 +98,10 @@ static FK_IN_SCHEMA_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bnf\.nspname\s*=\s*'([^']*)'").unwrap());
 static FK_IN_TABLE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\btf\.relname\s*=\s*'([^']*)'").unwrap());
+// Beekeeper's getTableCreateScript filters the columns by `c.relname = '<t>'`
+// (schema comes from the shared `n.nspname` predicate).
+static CREATE_SCRIPT_TABLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bc\.relname\s*=\s*'([^']*)'").unwrap());
 static QUOTE_IDENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bquote_ident\s*\(\s*([^()]+?)\s*\)").unwrap());
 // Beekeeper's listTableColumns asks for column comments via
@@ -843,6 +847,21 @@ WHERE 1 = 0
         }
     }
 
+    // Beekeeper's getTableCreateScript reconstructs a table's DDL by walking
+    // PG_CLASS/PG_ATTRIBUTE/PG_ATTRDEF and stitching the column lines together
+    // with `array_agg(... ORDER BY ...)` + `array_to_string` -- array functions
+    // Exasol doesn't have. Rebuild the same `createtable` string natively from
+    // SYS.EXA_ALL_COLUMNS (with LISTAGG) plus the primary key from
+    // SYS.EXA_ALL_CONSTRAINT_COLUMNS.
+    if normalized.contains("as createtable") && normalized.contains("array_agg") {
+        if let (Some(table), Some(schema)) = (
+            CREATE_SCRIPT_TABLE_RE.captures(sql).map(|c| c[1].to_owned()),
+            FK_OUT_SCHEMA_RE.captures(sql).map(|c| c[1].to_owned()),
+        ) {
+            return create_table_script_query(&schema, &table);
+        }
+    }
+
     sql.to_owned()
 }
 
@@ -909,6 +928,39 @@ fn foreign_key_query(schema: &str, table: &str, incoming: bool) -> String {
          ORDER BY cc.CONSTRAINT_NAME, cc.ORDINAL_POSITION",
         esc(schema),
         esc(table)
+    )
+}
+
+/// Native reconstruction of Beekeeper's getTableCreateScript output: a single
+/// `createtable` string holding the `CREATE TABLE` DDL (columns with type,
+/// NOT NULL and DEFAULT) plus an `ALTER TABLE ... ADD PRIMARY KEY` when the
+/// table has one. Built with LISTAGG since Exasol has no array aggregation.
+/// Note: Exasol's `||` follows Oracle semantics (NULL concatenates as empty),
+/// so the primary-key clause is guarded with an explicit `IS NOT NULL` CASE
+/// rather than COALESCE over a concatenation.
+fn create_table_script_query(schema: &str, table: &str) -> String {
+    let esc = |s: &str| s.replace('\'', "''");
+    let schema = esc(schema);
+    let table = esc(table);
+    format!(
+        "SELECT 'CREATE TABLE \"' || cols.COLUMN_SCHEMA || '\".\"' || cols.COLUMN_TABLE || '\" (' \
+         || CHR(10) || cols.col_defs || CHR(10) || ');' \
+         || CASE WHEN pk.pk_cols IS NOT NULL THEN CHR(10) || 'ALTER TABLE \"' || cols.COLUMN_SCHEMA \
+         || '\".\"' || cols.COLUMN_TABLE || '\" ADD PRIMARY KEY (' || pk.pk_cols || ');' ELSE '' END \
+         AS \"createtable\" \
+         FROM (SELECT COLUMN_SCHEMA, COLUMN_TABLE, \
+         LISTAGG('  \"' || COLUMN_NAME || '\" ' || COLUMN_TYPE \
+         || CASE WHEN COLUMN_IS_NULLABLE THEN '' ELSE ' NOT NULL' END \
+         || CASE WHEN COLUMN_DEFAULT IS NOT NULL THEN ' DEFAULT ' || COLUMN_DEFAULT ELSE '' END, \
+         ',' || CHR(10)) WITHIN GROUP (ORDER BY COLUMN_ORDINAL_POSITION) AS col_defs \
+         FROM SYS.EXA_ALL_COLUMNS WHERE COLUMN_SCHEMA = '{schema}' AND COLUMN_TABLE = '{table}' \
+         GROUP BY COLUMN_SCHEMA, COLUMN_TABLE) cols \
+         LEFT JOIN (SELECT CONSTRAINT_SCHEMA, CONSTRAINT_TABLE, \
+         LISTAGG('\"' || COLUMN_NAME || '\"', ', ') WITHIN GROUP (ORDER BY ORDINAL_POSITION) AS pk_cols \
+         FROM SYS.EXA_ALL_CONSTRAINT_COLUMNS WHERE CONSTRAINT_TYPE = 'PRIMARY KEY' \
+         AND CONSTRAINT_SCHEMA = '{schema}' AND CONSTRAINT_TABLE = '{table}' \
+         GROUP BY CONSTRAINT_SCHEMA, CONSTRAINT_TABLE) pk \
+         ON pk.CONSTRAINT_SCHEMA = cols.COLUMN_SCHEMA AND pk.CONSTRAINT_TABLE = cols.COLUMN_TABLE"
     )
 }
 
@@ -1638,6 +1690,24 @@ WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
                 .unwrap()
                 .contains("OFFSET 50")
         );
+    }
+
+    #[test]
+    fn rewrites_beekeeper_create_table_script_query() {
+        let sql = "SELECT 'CREATE TABLE ' || quote_ident(tabdef.schema_name) \
+            || array_to_string(array_agg('  ' || quote_ident(tabdef.column_name) ORDER BY tabdef.column_idx ASC), ',') AS createtable \
+            FROM ( SELECT c.relname AS table_name, a.attname AS column_name, n.nspname as schema_name \
+            FROM pg_class c JOIN pg_namespace n ON (n.oid = c.relnamespace) JOIN pg_attribute a ON (a.attrelid = c.oid) \
+            WHERE c.relname = 'EXA_CANDIDATE_QUEUE' AND n.nspname = 'EXA_INVESTIGATION' ORDER BY a.attnum DESC ) AS tabdef \
+            GROUP BY tabdef.schema_name, tabdef.table_name";
+        let out = translate_postgres_to_exasol(sql).unwrap();
+        let upper = out.to_ascii_uppercase();
+        assert!(!upper.contains("ARRAY_AGG") && !upper.contains("ARRAY_TO_STRING"), "got: {out}");
+        assert!(!upper.contains("PG_CLASS"), "got: {out}");
+        assert!(upper.contains("FROM SYS.EXA_ALL_COLUMNS"));
+        assert!(upper.contains("LISTAGG"));
+        assert!(out.contains("AS \"createtable\""));
+        assert!(out.contains("COLUMN_SCHEMA = 'EXA_INVESTIGATION'") && out.contains("COLUMN_TABLE = 'EXA_CANDIDATE_QUEUE'"), "got: {out}");
     }
 
     #[test]
