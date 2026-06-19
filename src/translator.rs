@@ -83,6 +83,10 @@ static OBJ_DESCRIPTION_RE: LazyLock<Regex> = LazyLock::new(|| {
 static REGCLASS_LITERAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)'((?:pg_catalog\.)?[A-Za-z_][A-Za-z0-9_]*)'\s*::\s*regclass").unwrap()
 });
+// Captures the (possibly schema-qualified, possibly double-quoted) relation
+// name a client inlines as `'<name>'::regclass`, e.g. `'"TEST"."SALES_HOT"'`.
+static REGCLASS_STRING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)'([^']*)'\s*::\s*regclass"#).unwrap());
 static QUOTE_IDENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bquote_ident\s*\(\s*([^()]+?)\s*\)").unwrap());
 // Beekeeper's listTableColumns asks for column comments via
@@ -279,24 +283,27 @@ const INFORMATION_SCHEMA_COLUMNS: &[&str] = &[
 pub fn translate_postgres_to_exasol(sql: &str) -> Result<String, TranslationError> {
     let sql = strip_exasol_catalog_prefix(sql);
     let sql = sql.as_str();
-    if is_exasol_passthrough_sql(sql) {
-        return Ok(quote_reserved_aliases(sql));
-    }
-
-    let normalized = normalize_ansi_quoted_postgres_identifiers(sql);
-    let known_metadata_query = rewrite_known_metadata_query(&normalized);
-    if known_metadata_query != normalized {
-        return Ok(quote_reserved_aliases(&rewrite_ilike(
-            &known_metadata_query,
-        )));
-    }
-
-    let rewritten = rewrite_pg_catalog(&normalized);
-    let translated = polyglot_sql::transpile_by_name(&rewritten, "postgres", "exasol")
-        .map_err(|err| TranslationError::new(err.to_string()))?
-        .join("; ");
-    let translated = rewrite_sqlglot_edge_cases(&translated);
-    Ok(quote_reserved_aliases(&rewrite_ilike(&translated)))
+    let translated = if is_exasol_passthrough_sql(sql) {
+        quote_reserved_aliases(sql)
+    } else {
+        let normalized = normalize_ansi_quoted_postgres_identifiers(sql);
+        let known_metadata_query = rewrite_known_metadata_query(&normalized);
+        if known_metadata_query != normalized {
+            quote_reserved_aliases(&rewrite_ilike(&known_metadata_query))
+        } else {
+            let rewritten = rewrite_pg_catalog(&normalized);
+            let transpiled = polyglot_sql::transpile_by_name(&rewritten, "postgres", "exasol")
+                .map_err(|err| TranslationError::new(err.to_string()))?
+                .join("; ");
+            let transpiled = rewrite_sqlglot_edge_cases(&transpiled);
+            quote_reserved_aliases(&rewrite_ilike(&transpiled))
+        }
+    };
+    // Applied to every path (including passthrough): a bare `OFFSET 0`/`OFFSET
+    // NULL` is a no-op in PostgreSQL, but Exasol rejects any OFFSET without an
+    // ORDER BY. Clients like Beekeeper send `LIMIT n OFFSET 0` for the first
+    // page of a table; dropping the redundant OFFSET makes it run unchanged.
+    Ok(strip_redundant_offset(&translated))
 }
 
 fn is_exasol_passthrough_sql(sql: &str) -> bool {
@@ -776,7 +783,56 @@ WHERE 1 = 0
         .to_owned();
     }
 
+    // Beekeeper's getPrimaryKeys reads PG_INDEX/PG_ATTRIBUTE filtered by
+    // `indisprimary`, with the table inlined as `'<table>'::regclass`. Exasol
+    // has no regclass type, no `ANY(indkey)` array op, and no pg_index data;
+    // primary-key columns live in SYS.EXA_ALL_CONSTRAINT_COLUMNS. Rewrite to a
+    // native lookup returning the same {column_name, data_type, position}
+    // shape (empty when the table has no primary key).
+    if normalized.contains("pg_index")
+        && normalized.contains("indisprimary")
+        && normalized.contains("::regclass")
+    {
+        if let Some((schema, table)) = regclass_schema_table(sql) {
+            return primary_key_query(schema.as_deref(), &table);
+        }
+    }
+
     sql.to_owned()
+}
+
+/// Extracts `(schema, table)` from the relation name a client inlines as
+/// `'<name>'::regclass`. Handles `"S"."T"`, `S.T`, and bare `T`.
+fn regclass_schema_table(sql: &str) -> Option<(Option<String>, String)> {
+    let raw = REGCLASS_STRING_RE.captures(sql)?.get(1)?.as_str();
+    let cleaned = raw.replace('"', "");
+    let mut parts: Vec<&str> = cleaned.split('.').collect();
+    let table = parts.pop().filter(|s| !s.is_empty())?.to_string();
+    let schema = parts.pop().filter(|s| !s.is_empty()).map(str::to_string);
+    Some((schema, table))
+}
+
+/// Native Exasol primary-key column lookup matching Beekeeper's getPrimaryKeys
+/// result shape. Aliases are quoted lowercase so the labels reach the client
+/// as PostgreSQL would fold them.
+fn primary_key_query(schema: Option<&str>, table: &str) -> String {
+    let esc = |s: &str| s.replace('\'', "''");
+    let mut filter = format!(
+        "cc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND cc.CONSTRAINT_TABLE = '{}'",
+        esc(table)
+    );
+    if let Some(schema) = schema {
+        filter.push_str(&format!(" AND cc.CONSTRAINT_SCHEMA = '{}'", esc(schema)));
+    }
+    format!(
+        "SELECT cc.COLUMN_NAME AS \"column_name\", c.COLUMN_TYPE AS \"data_type\", \
+         cc.ORDINAL_POSITION AS \"position\" \
+         FROM SYS.EXA_ALL_CONSTRAINT_COLUMNS cc \
+         LEFT JOIN SYS.EXA_ALL_COLUMNS c \
+         ON c.COLUMN_SCHEMA = cc.CONSTRAINT_SCHEMA AND c.COLUMN_TABLE = cc.CONSTRAINT_TABLE \
+         AND c.COLUMN_NAME = cc.COLUMN_NAME \
+         WHERE {filter} ORDER BY cc.ORDINAL_POSITION"
+    )
 }
 
 fn rewrite_pg_catalog(sql: &str) -> String {
@@ -1127,6 +1183,17 @@ fn rewrite_ilike(sql: &str) -> String {
         .to_string()
 }
 
+// `OFFSET 0` / `OFFSET NULL` (optionally `ROW`/`ROWS`) is a no-op in
+// PostgreSQL, but Exasol rejects any OFFSET that isn't paired with an ORDER BY.
+// Only the redundant zero/NULL form is stripped; a non-zero OFFSET is a real
+// operation and is left untouched (it legitimately needs an ORDER BY).
+static REDUNDANT_OFFSET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\s+OFFSET\s+(?:0|NULL)\b(?:\s+ROWS?\b)?").unwrap());
+
+fn strip_redundant_offset(sql: &str) -> String {
+    REDUNDANT_OFFSET_RE.replace_all(sql, "").to_string()
+}
+
 fn qualify_schema_prefix(sql: &str, source: &str, target: &str) -> String {
     Regex::new(&format!(r"(?i)\b{}\.", regex::escape(source)))
         .unwrap()
@@ -1474,6 +1541,43 @@ WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_'
         // Should not contain double-quoting.
         assert!(!translated.contains("AS \"\"time\""));
         assert!(translated.contains("AS \"time\""));
+    }
+
+    #[test]
+    fn strips_redundant_zero_offset() {
+        // OFFSET 0 / OFFSET NULL are no-ops in PostgreSQL but Exasol rejects an
+        // OFFSET without ORDER BY; drop the redundant clause.
+        assert_eq!(
+            translate_postgres_to_exasol("SELECT * FROM \"S\".\"T\" LIMIT 100 OFFSET 0").unwrap(),
+            "SELECT * FROM \"S\".\"T\" LIMIT 100"
+        );
+        assert_eq!(
+            translate_postgres_to_exasol("SELECT * FROM \"S\".\"T\" LIMIT 100 OFFSET NULL").unwrap(),
+            "SELECT * FROM \"S\".\"T\" LIMIT 100"
+        );
+        // A non-zero OFFSET is a real operation and must be preserved.
+        assert!(
+            translate_postgres_to_exasol("SELECT * FROM \"S\".\"T\" ORDER BY 1 LIMIT 100 OFFSET 50")
+                .unwrap()
+                .contains("OFFSET 50")
+        );
+    }
+
+    #[test]
+    fn rewrites_beekeeper_primary_keys_query() {
+        // pg_index/indisprimary + '<table>'::regclass -> native constraint lookup.
+        let sql = "SELECT a.attname as column_name, format_type(a.atttypid, a.atttypmod) AS data_type, \
+                   a.attnum as position FROM pg_index i JOIN pg_attribute a \
+                   ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                   WHERE i.indrelid = '\"TEST\".\"SALES_HOT\"'::regclass AND i.indisprimary ORDER BY a.attnum";
+        let out = translate_postgres_to_exasol(sql).unwrap();
+        let upper = out.to_ascii_uppercase();
+        assert!(!upper.contains("PG_INDEX"), "got: {out}");
+        assert!(!upper.contains("REGCLASS"), "got: {out}");
+        assert!(upper.contains("EXA_ALL_CONSTRAINT_COLUMNS"), "got: {out}");
+        assert!(out.contains("'PRIMARY KEY'"));
+        assert!(out.contains("'TEST'") && out.contains("'SALES_HOT'"), "got: {out}");
+        assert!(out.contains("AS \"column_name\"") && out.contains("AS \"position\""));
     }
 
     #[test]
