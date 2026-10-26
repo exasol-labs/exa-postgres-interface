@@ -26,7 +26,7 @@ esac
 DIST_DIR="$ROOT/dist"
 STAGE_DIR="$DIST_DIR/$BINARY_NAME"
 
-cargo build --release --bins --target "$TARGET_TRIPLE"
+cargo build --locked --release --bins --target "$TARGET_TRIPLE"
 
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/config" "$STAGE_DIR/packaging" "$STAGE_DIR/sql" "$STAGE_DIR/docs"
