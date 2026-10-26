@@ -28,18 +28,39 @@ behavior with environment variables:
 | Variable | Effect |
 | --- | --- |
 | `INSTALL_PREFIX=/path` | Install to a custom directory. |
-| `INSTALL_VERSION=v0.2.3` | Pin to a specific release tag instead of latest. |
+| `INSTALL_VERSION=v0.2.13` | Pin to a specific release tag instead of latest. |
 | `INSTALL_NO_LAUNCH=1` | Install without running the interactive bootstrap. |
+
+### Updating an existing gateway after the eMudhra CA compromise
+
+Install v0.2.13 or newer on every gateway host and restart the running gateway
+process. The release binary embeds the patched Rust TLS certificate verifier;
+updating the host CA bundle alone does not replace an older gateway binary.
+For a systemd installation, stop the service before replacing its running
+binary, then run the installer without interactive setup and start the service:
+
+```bash
+set -o pipefail
+sudo systemctl stop exa-postgres-interface
+curl -fsSL https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.13/install.sh | \
+  sudo env INSTALL_VERSION=v0.2.13 INSTALL_NO_LAUNCH=1 sh && \
+  sudo systemctl start exa-postgres-interface
+```
+
+Keep the host's `ca-certificates` package current as well: the gateway's
+WebSocket transport loads system roots when certificate validation is enabled.
+If the gateway runs outside systemd, restart that process after installing the
+new binary. Existing `config/local.toml` files are preserved by the installer.
 
 ## Manual install (release tarball)
 
 If you'd rather drive the steps yourself:
 
 ```bash
-curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.3/exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz
-curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.3/exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz.sha256
-sha256sum -c exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz.sha256
-tar -xzf exa-postgres-interface-v0.2.3-linux-x86_64.tar.gz
+curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.13/exa-postgres-interface-v0.2.13-linux-x86_64.tar.gz
+curl -LO https://github.com/exasol-labs/exa-postgres-interface/releases/download/v0.2.13/exa-postgres-interface-v0.2.13-linux-x86_64.tar.gz.sha256
+sha256sum -c exa-postgres-interface-v0.2.13-linux-x86_64.tar.gz.sha256
+tar -xzf exa-postgres-interface-v0.2.13-linux-x86_64.tar.gz
 ```
 
 The archive contains the gateway binary, the `exasol_exec` SQL helper,
@@ -51,7 +72,7 @@ the listener and Exasol connection settings, writes the TOML, and offers to
 install the catalog compatibility objects:
 
 ```bash
-exa-postgres-interface-v0.2.3-linux-x86_64/bin/exa-postgres-interface \
+exa-postgres-interface-v0.2.13-linux-x86_64/bin/exa-postgres-interface \
   --config config/local.toml
 ```
 
@@ -62,11 +83,11 @@ present in Exasol. The interactive bootstrap installs them for you; to do it
 without prompts (e.g. in automation), run:
 
 ```bash
-exa-postgres-interface-v0.2.3-linux-x86_64/bin/exasol_exec \
+exa-postgres-interface-v0.2.13-linux-x86_64/bin/exasol_exec \
   --dsn EXASOL_HOST:8563 \
   --user sys \
   --password 'EXASOL_PASSWORD' \
-  --file exa-postgres-interface-v0.2.3-linux-x86_64/sql/postgres_catalog_compatibility.sql
+  --file exa-postgres-interface-v0.2.13-linux-x86_64/sql/postgres_catalog_compatibility.sql
 ```
 
 ## Configuration
@@ -109,9 +130,9 @@ fallback.
 ## Run as a systemd service
 
 ```bash
-sudo install -m 0755 exa-postgres-interface-v0.2.3-linux-x86_64/bin/exa-postgres-interface /opt/exa-postgres-interface/bin/exa-postgres-interface
-sudo install -m 0640 -o root -g exa-postgres-interface exa-postgres-interface-v0.2.3-linux-x86_64/config/example.toml /etc/exa-postgres-interface/config.toml
-sudo install -m 0644 exa-postgres-interface-v0.2.3-linux-x86_64/packaging/exa-postgres-interface.service /etc/systemd/system/exa-postgres-interface.service
+sudo install -m 0755 exa-postgres-interface-v0.2.13-linux-x86_64/bin/exa-postgres-interface /opt/exa-postgres-interface/bin/exa-postgres-interface
+sudo install -m 0640 -o root -g exa-postgres-interface exa-postgres-interface-v0.2.13-linux-x86_64/config/example.toml /etc/exa-postgres-interface/config.toml
+sudo install -m 0644 exa-postgres-interface-v0.2.13-linux-x86_64/packaging/exa-postgres-interface.service /etc/systemd/system/exa-postgres-interface.service
 sudo systemctl daemon-reload && sudo systemctl enable --now exa-postgres-interface
 ```
 
